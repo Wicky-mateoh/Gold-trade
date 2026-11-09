@@ -77,3 +77,14 @@ def test_journal_persists(tmp_path):
     j = Journal(tmp_path / "j.jsonl")
     j.record("operator_note", {"x": 1})
     assert Journal(tmp_path / "j.jsonl").rows[0]["payload"] == {"x": 1}
+
+
+def test_app_mode_live_env_does_not_arm_live(synthetic_engine, tmp_path):
+    from app.config import Settings
+    from app.service import TradingService
+    from tests.conftest import ROOT
+
+    s = Settings(_env_file=None, app_mode="live", live_trading_authorized=True, broker_connected=True)
+    svc = TradingService(s, ROOT, engine=synthetic_engine, state_dir=tmp_path)
+    assert svc.book.live_enabled is False and svc.book.mode != "live"
+    assert svc.journal.query("mode_change")[0]["payload"]["accepted"] is False

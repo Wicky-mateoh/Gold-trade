@@ -41,6 +41,20 @@ It has 143 tests and runs in about 7 seconds.
 6. Only then is a **live review** reasonable (see DEPLOYMENT.md). Passing these gates is
    evidence, not a guarantee.
 
+## Testing on your broker's real history
+
+On the Windows PC with MT5:
+
+```bat
+python scripts\export_mt5_history.py --bars 200000
+```
+
+This writes `data\history\XAUUSD_M5_<from>_<to>.csv` with UTC times. Then replay it:
+
+```bat
+python scripts\replay.py --csv data\history\<file>.csv --start-days 120 --step-bars 12
+```
+
 ## End-to-end replay (live code path)
 
 ```bash

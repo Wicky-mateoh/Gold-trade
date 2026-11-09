@@ -80,6 +80,20 @@ class PromoteRequest(BaseModel):
     version: str
 
 
+def setup_logging(log_dir: Path) -> None:
+    """Rotating log files (5 x 5 MB) so an unattended bot keeps a bounded history."""
+    from logging.handlers import RotatingFileHandler
+
+    log_dir.mkdir(parents=True, exist_ok=True)
+    root = logging.getLogger()
+    if any(isinstance(h, RotatingFileHandler) for h in root.handlers):
+        return
+    handler = RotatingFileHandler(log_dir / "gits.log", maxBytes=5_000_000, backupCount=5, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+
+
 async def _autonomous(svc: TradingService, interval: float) -> None:
     """Background loop so the bot keeps working with no dashboard open."""
     log = logging.getLogger("gits.cycle")
@@ -98,6 +112,9 @@ def create_app(service: TradingService | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        if service is None:
+            setup_logging(ROOT / "var" / "logs")
+            logging.getLogger("gits").info("Starting GITS %s", __version__)
         holder["svc"] = service or TradingService(load_settings(), ROOT)
         interval = float(os.environ.get("AUTO_CYCLE_SECONDS", "60"))
         task = asyncio.create_task(_autonomous(holder["svc"], interval)) if interval > 0 and service is None else None

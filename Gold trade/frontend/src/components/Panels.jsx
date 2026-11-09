@@ -309,10 +309,10 @@ export function RiskPanel({ risk, onAckPause }) {
       {risk.open_positions.length > 0 && (
         <div className="table-wrap">
           <table>
-            <thead><tr><th>ID</th><th>Side</th><th>Entry</th><th>SL</th><th>TP</th><th>Lots</th></tr></thead>
+            <thead><tr><th>ID</th><th>Type</th><th>Side</th><th>Entry</th><th>SL</th><th>TP</th><th>Lots</th></tr></thead>
             <tbody>
               {risk.open_positions.map((p) => (
-                <tr key={p.id}><td className="mono">{p.id}</td><td className={tone(p.direction)}>{p.direction}</td><td className="num">{fmt(p.entry)}</td><td className="num">{fmt(p.stop_loss)}</td><td className="num">{fmt(p.take_profit)}</td><td className="num">{p.lots}</td></tr>
+                <tr key={p.id}><td className="mono">{p.id}</td><td>{p.mode === "live" ? <Badge tone="down">live</Badge> : <Badge>paper</Badge>}</td><td className={tone(p.direction)}>{p.direction}</td><td className="num">{fmt(p.entry)}</td><td className="num">{fmt(p.stop_loss)}</td><td className="num">{fmt(p.take_profit)}</td><td className="num">{p.lots}</td></tr>
               ))}
             </tbody>
           </table>

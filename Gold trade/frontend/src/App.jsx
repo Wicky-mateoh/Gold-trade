@@ -108,6 +108,18 @@ export default function App() {
     setRunning(false);
   };
 
+  const goLive = () => {
+    const b = status?.broker;
+    const kind = b?.account_type === "real" ? "REAL MONEY" : "DEMO";
+    const phrase = `SEND ${kind} ORDERS`;
+    const typed = window.prompt(
+      `Arm live mode on ${b?.server} account ${b?.login} (${kind}).\n` +
+        `Orders are capped at ${b?.live_max_lots} lots and carry broker-side stops.\n\nType exactly: ${phrase}`,
+    );
+    if (typed !== phrase) return notify("Live mode not armed.", "info");
+    act(api.requestLive, (r) => (r.accepted ? `Live mode armed (${kind}).` : `Live refused: ${[...r.missing, ...(r.hints || [])].join("; ")}`));
+  };
+
   const shutdown = () => {
     const reason = window.prompt("Emergency shutdown reason:");
     if (reason && reason.length >= 3) act(() => api.shutdown(reason), (r) => `Emergency shutdown active · ${r.flattened} paper positions flattened`);
@@ -148,13 +160,29 @@ export default function App() {
           <Badge tone={live ? "up" : "flat"}>{live ? "● live stream" : "○ polling"}</Badge>
           {status?.emergency_shutdown && <Badge tone="down">EMERGENCY STOP</Badge>}
           {analysis?.tier1?.blackout && <Badge tone="down">NFP/CPI WINDOW</Badge>}
+          {status?.broker && (
+            <Badge tone={status.broker.ready ? (status.broker.account_type === "real" ? "down" : "up") : "flat"}>
+              MT5 {status.broker.account_type || ""} {status.broker.ready ? "ready" : "not ready"}
+            </Badge>
+          )}
+          {status?.mode === "live" && <Badge tone="down">LIVE ORDERS ON</Badge>}
         </div>
         <div className="controls">
           <div className="seg">
             {["analysis", "paper"].map((m) => (
               <button key={m} className={status?.mode === m ? "on" : ""} onClick={() => act(() => api.setMode(m), (r) => r.reason)}>{m}</button>
             ))}
-            <button disabled title={`Live needs: ${(status?.live_checklist_missing || []).join(", ")}`}>live 🔒</button>
+            {status?.mode === "live" ? (
+              <button className="on live-on">live</button>
+            ) : (
+              <button
+                disabled={!status?.broker?.ready}
+                onClick={goLive}
+                title={status?.broker?.ready ? "Arm live orders (asks for confirmation)" : `Live needs: ${[...(status?.live_checklist_missing || []), ...(status?.broker?.reasons || [])].join("; ")}`}
+              >
+                live {status?.broker?.ready ? "" : "🔒"}
+              </button>
+            )}
           </div>
           <button className="btn" onClick={() => act(api.markPaper, (r) => `${r.closed.length} paper positions closed`)}>Mark paper</button>
           {status?.emergency_shutdown
@@ -167,6 +195,14 @@ export default function App() {
       </header>
 
       {error && <div className="banner error">API unreachable: {error}</div>}
+      {status?.mode === "live" && (
+        <div className="banner error">
+          Live mode: this bot is sending orders to {status.broker?.server} account {status.broker?.login} ({status.broker?.account_type}). Use Emergency stop to close all positions and disarm.
+        </div>
+      )}
+      {status?.broker && !status.broker.ready && status.mode !== "live" && (
+        <div className="banner">MT5 orders unavailable: {(status.broker.reasons || []).join(" · ")}</div>
+      )}
       {status?.data_source === "synthetic" && (
         <div className="banner">Demo mode: prices are a synthetic random path and the calendar/news are example rows. Load broker or CSV data before drawing conclusions.</div>
       )}

@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 
 from app.analysis import build_context
+from app.broker_mt5 import MT5Adapter, client_id
 from app.econ_calendar import EventCalendar
 from app.backtest import CostModel, run_backtest, validate_out_of_sample
 from app.execution import CLOSE_EVENTS, ExecutionBook, LiveChecklist
@@ -37,6 +38,7 @@ from app.profiles import get_profile
 from app.risk import AccountState, OrderProposal, assess, propose_stop_update, register_closed_trade, roll_account_clock
 from app.sentiment import NewsItem, load_news_directory
 from app.signals import decide
+from app.state import StateStore
 
 
 class TradingService:
@@ -67,12 +69,85 @@ class TradingService:
         self.last_backtest: dict | None = None
         self.last_validation: dict | None = None
         self._last_recorded_bar: str | None = None
-        if settings.app_mode == "paper":
+        # Live broker positions opened by this bot, keyed by MT5 ticket.
+        self.live_positions: dict[str, dict] = {}
+        self.broker: MT5Adapter | None = MT5Adapter(settings) if settings.broker_adapter == "mt5" else None
+        if self.broker is not None:
+            self.book.adapter = self.broker
+            self.broker.check()
+        self.state = StateStore(self.state_dir / "state.json")
+        restored = self._restore()
+        if not restored and settings.app_mode == "paper":
             self.book.set_mode("paper")
-        elif settings.app_mode == "live":
-            # Live is never armed from configuration alone.
-            result = self.book.request_live(self._checklist_from_settings())
-            self.journal.record("mode_change", result, note="Startup requested live mode from APP_MODE.")
+        if settings.app_mode == "live":
+            # Live is never armed from configuration alone: the full checklist and a ready adapter are required.
+            result = self.request_live(self._checklist_from_settings(), note="Startup requested live mode from APP_MODE.")
+            if not result["accepted"] and not restored:
+                self.book.set_mode("paper")
+
+    # ------------------------------------------------------------------ state
+    def _restore(self) -> bool:
+        data = self.state.load()
+        if data is None:
+            return False
+        a = data.get("account", {})
+        self.account.equity = float(a.get("equity", self.account.equity))
+        self.account.day_start_equity = float(a.get("day_start_equity", self.account.equity))
+        self.account.week_start_equity = float(a.get("week_start_equity", self.account.equity))
+        self.account.day_key = a.get("day_key", "")
+        self.account.week_key = a.get("week_key", "")
+        self.account.consecutive_losses = int(a.get("consecutive_losses", 0))
+        self.account.loss_pause = bool(a.get("loss_pause", False))
+        self.account.emergency_shutdown = bool(a.get("emergency_shutdown", False))
+        self.book.paper_positions = list(data.get("paper_positions", []))
+        self.live_positions = dict(data.get("live_positions", {}))
+        self.equity_history = list(data.get("equity_history", self.equity_history))[-500:]
+        self._last_recorded_bar = data.get("last_recorded_bar")
+        saved_mode = data.get("mode", "paper")
+        self.book.set_mode(saved_mode if saved_mode in {"analysis", "paper"} else "paper")
+        self.account.open_positions = self._open_positions()
+        self.journal.record(
+            "operator_note",
+            {
+                "restored_from": str(self.state.path),
+                "saved_at": data.get("saved_at"),
+                "equity": self.account.equity,
+                "paper_positions": len(self.book.paper_positions),
+                "live_positions": len(self.live_positions),
+                "mode": self.book.mode,
+                "saved_mode": saved_mode,
+                "emergency_shutdown": self.account.emergency_shutdown,
+                "loss_pause": self.account.loss_pause,
+            },
+            note="State restored after restart." + (" Live mode was not restored; re-arm it." if saved_mode == "live" else ""),
+        )
+        return True
+
+    def _save(self) -> None:
+        a = self.account
+        self.state.save(
+            {
+                "mode": self.book.mode,
+                "account": {
+                    "equity": a.equity,
+                    "day_start_equity": a.day_start_equity,
+                    "week_start_equity": a.week_start_equity,
+                    "day_key": a.day_key,
+                    "week_key": a.week_key,
+                    "consecutive_losses": a.consecutive_losses,
+                    "loss_pause": a.loss_pause,
+                    "emergency_shutdown": a.emergency_shutdown,
+                },
+                "paper_positions": self.book.paper_positions,
+                "live_positions": self.live_positions,
+                "equity_history": self.equity_history[-500:],
+                "last_recorded_bar": self._last_recorded_bar,
+            }
+        )
+
+    def _open_positions(self) -> list[dict]:
+        """Everything the risk gate must count: simulated and live."""
+        return [dict(row) for row in self.book.paper_positions] + [dict(row) for row in self.live_positions.values()]
 
     # ------------------------------------------------------------------ status
     def _checklist_from_settings(self) -> LiveChecklist:
@@ -105,6 +180,9 @@ class TradingService:
             "calendar_feed": self.calendar.feed_status,
             "strategy_profile": self.profile.name,
             "news_loaded": len(self.news),
+            "broker": None if self.broker is None else self.broker.status,
+            "live_positions": list(self.live_positions.values()),
+            "state_file": str(self.state.path),
         }
 
     # ---------------------------------------------------------------- analysis
@@ -123,10 +201,14 @@ class TradingService:
         """
         with self.lock:
             closed = self.mark_paper() if record and self.book.mode == "paper" else []
+            if record and self.broker is not None:
+                closed += self.reconcile_live()
             context, payload = build_context(self.engine, self.calendar, self.news, self.settings, now)
             tier1 = payload.get("tier1") or {}
-            if record and tier1.get("flatten_due") and self.book.paper_positions:
+            if record and tier1.get("flatten_due") and (self.book.paper_positions or self.live_positions):
                 closed += self._event_flatten(tier1)
+            orders_sent = 0
+            live_order = None
             bar_key = context.timestamp.astimezone(timezone.utc).isoformat()
             repeat = record and bar_key == self._last_recorded_bar
             persist = record and not repeat
@@ -142,8 +224,8 @@ class TradingService:
             signal["atr"] = context.atr
             risk = None
             position = None
-            # The risk gate counts the book's real open positions.
-            self.account.open_positions = [dict(row) for row in self.book.paper_positions]
+            # The risk gate counts every open position, simulated and live.
+            self.account.open_positions = self._open_positions()
             if signal["actionable"]:
                 proposal = OrderProposal(
                     direction=signal["direction"],
@@ -164,7 +246,7 @@ class TradingService:
                     if position:
                         # Entry is at this bar's close, so marking starts with the next bar.
                         position["marked_until"] = bar_key
-                        self.account.open_positions = [dict(row) for row in self.book.paper_positions]
+                        self.account.open_positions = self._open_positions()
                         self.journal.record(
                             "execution",
                             {**position, "event": "open", "confidence": signal["confidence"], "regime": signal["regime"]},
@@ -172,17 +254,29 @@ class TradingService:
                     else:
                         for row in self.book.fills[fills_before:]:
                             self.journal.record("execution", row, note="Paper fill refused.")
+                if (
+                    persist
+                    and risk["approved"]
+                    and self.book.mode == "live"
+                    and self.book.live_enabled
+                    and self.broker is not None
+                ):
+                    live_order = self._send_live(signal, risk, bar_key)
+                    orders_sent = int(live_order.get("status") in {"filled", "closed_unprotected"})
             elif persist:
                 self.journal.record("rejected_setup", signal)
             if persist:
                 self._last_recorded_bar = bar_key
+            if record:
+                self._save()
             result = {
                 "signal": signal,
                 "risk": risk,
                 "paper_position": position,
                 "paper_closed": closed,
                 "mode": self.book.mode,
-                "orders_sent_to_broker": 0,
+                "orders_sent_to_broker": orders_sent,
+                "live_order": live_order,
                 "analysis_timestamp": payload["timestamp"],
                 "repeat_of_journaled_bar": repeat,
                 "tier1": tier1,
@@ -221,10 +315,101 @@ class TradingService:
             for row in closed:
                 register_closed_trade(self.account, row["pnl"], self.settings)
                 self.journal.record("execution", row)
-            self.account.open_positions = [dict(row) for row in self.book.paper_positions]
+            self.account.open_positions = self._open_positions()
             if closed:
                 self.equity_history.append({"time": datetime.now(timezone.utc).isoformat(), "equity": self.account.equity})
+                self._save()
             return to_jsonable(closed)
+
+    # ------------------------------------------------------------------ live
+    def _send_live(self, signal: dict, risk: dict, bar_key: str) -> dict:
+        order = {
+            "client_id": client_id(self.settings.mt5_symbol, bar_key, signal["direction"]),
+            "direction": signal["direction"],
+            "lots": risk["lots"],
+            "stop_loss": signal["stop_loss"],
+            "take_profit": signal["take_profits"][0],
+            "entry_low": signal["entry_low"],
+            "entry_high": signal["entry_high"],
+        }
+        result = self.broker.submit(order)
+        self.journal.record("execution", {"event": "live_order", "mode": "live", "order": order, **result})
+        if result.get("status") == "filled" and result.get("ticket") is not None:
+            lots = float(result["volume"])
+            stop_distance = abs(float(result["price"]) - float(result["sl"]))
+            self.live_positions[str(result["ticket"])] = {
+                "id": str(result["ticket"]),
+                "ticket": result["ticket"],
+                "mode": "live",
+                "direction": signal["direction"],
+                "entry": result["price"],
+                "stop_loss": result["sl"],
+                "take_profit": result["tp"],
+                "lots": lots,
+                "risk_amount": round(stop_distance * lots * self.settings.contract_ounces, 2),
+                "opened_at": datetime.now(timezone.utc).isoformat(),
+                "confidence": signal["confidence"],
+                "regime": signal.get("regime"),
+                "client_id": order["client_id"],
+            }
+            self.account.open_positions = self._open_positions()
+        return result
+
+    def reconcile_live(self) -> list[dict]:
+        """Sync with MT5: record positions the broker closed (SL/TP/stop-out), adopt
+        unknown positions carrying our magic number, enforce the max hold, and
+        take equity from the broker. MT5 is the source of truth."""
+        if self.broker is None or (not self.broker.ready and not self.live_positions):
+            return []
+        with self.lock:
+            try:
+                open_rows = {str(row["ticket"]): row for row in self.broker.positions()}
+            except RuntimeError as exc:
+                self.journal.record("operator_note", {"reconcile_error": str(exc)}, note="Could not read MT5 positions.")
+                return []
+            now = datetime.now(timezone.utc)
+            closed: list[dict] = []
+            max_hold = pd.Timedelta(minutes=self.profile.max_hold_minutes)
+            for ticket, meta in list(self.live_positions.items()):
+                row = open_rows.get(ticket)
+                if row is not None:
+                    meta.update(stop_loss=row["stop_loss"], take_profit=row["take_profit"], mark_profit=row["profit"])
+                    if now - pd.Timestamp(meta["opened_at"]) >= max_hold and not meta.get("close_requested"):
+                        result = self.broker.close(int(ticket), "max hold time")
+                        meta["close_requested"] = result["status"] == "closed"
+                        meta["pending_exit_reason"] = "max hold time"
+                        self.journal.record("execution", {"event": "live_close_request", **result})
+                    continue
+                outcome = self.broker.closed_result(int(ticket)) or {"pnl": 0.0, "exit_reason": "closed (no MT5 deal history found)"}
+                if meta.get("pending_exit_reason") and outcome.get("exit_reason") == "closed":
+                    outcome["exit_reason"] = meta["pending_exit_reason"]
+                record = {**meta, **outcome, "event": "close", "mode": "live", "closed_at": now.isoformat()}
+                del self.live_positions[ticket]
+                register_closed_trade(self.account, float(record["pnl"]), self.settings)
+                self.journal.record("execution", record)
+                closed.append(record)
+            for ticket, row in open_rows.items():
+                if ticket not in self.live_positions:
+                    self.live_positions[ticket] = {**row, "id": ticket, "mode": "live", "opened_at": now.isoformat(), "adopted": True,
+                                                   "risk_amount": round(abs(row["entry"] - row["stop_loss"]) * row["lots"] * self.settings.contract_ounces, 2)}
+                    self.journal.record("operator_note", {"adopted_position": row}, note="MT5 position with this bot's magic number adopted.")
+            equity = self.broker.equity()
+            if equity is not None:
+                self.account.equity = equity
+            self.account.open_positions = self._open_positions()
+            if closed:
+                self.equity_history.append({"time": now.isoformat(), "equity": self.account.equity})
+            self._save()
+            return to_jsonable(closed)
+
+    def _close_all_live(self, reason: str) -> list[dict]:
+        results = []
+        for ticket in list(self.live_positions):
+            result = self.broker.close(int(ticket), reason)
+            self.live_positions[ticket]["pending_exit_reason"] = reason
+            self.journal.record("execution", {"event": "live_close_request", **result})
+            results.append(result)
+        return results
 
     def refresh_data(self) -> dict:
         """Reload the configured source (CSV or MT5). Synthetic data is static."""
@@ -249,17 +434,21 @@ class TradingService:
         base = self.engine.frame("M5")
         if base is None or len(base) == 0:
             return []
+        names = [tier1[k]["next"]["name"] for k in ("nfp", "cpi") if tier1.get(k, {}).get("flatten_due") and tier1[k].get("next")]
         closed = self.book.flatten_paper(
             float(base.close[-1]), self.settings.max_slippage, self.settings.contract_ounces, event="event_flatten"
         )
-        names = [tier1[k]["next"]["name"] for k in ("nfp", "cpi") if tier1.get(k, {}).get("flatten_due") and tier1[k].get("next")]
         for row in closed:
             row["exit_reason"] = f"pre-release flatten: {', '.join(names)}"
             register_closed_trade(self.account, row["pnl"], self.settings)
             self.journal.record("execution", row, note="Closed before a tier-1 release.")
-        self.account.open_positions = [dict(r) for r in self.book.paper_positions]
+        if self.live_positions and self.broker is not None:
+            self._close_all_live(f"pre-release flatten: {', '.join(names)}")
+            closed += self.reconcile_live()
+        self.account.open_positions = self._open_positions()
         if closed:
             self.equity_history.append({"time": datetime.now(timezone.utc).isoformat(), "equity": self.account.equity})
+        self._save()
         return closed
 
     def cycle(self) -> dict:
@@ -274,12 +463,21 @@ class TradingService:
 
     def tighten_stop(self, position_id: str, new_stop: float) -> dict:
         with self.lock:
+            live = self.live_positions.get(str(position_id))
+            if live is not None and self.broker is not None:
+                result = self.broker.modify_stop(int(position_id), live["direction"], new_stop)
+                if result["accepted"]:
+                    live["stop_loss"] = result["stop"]
+                self.journal.record("execution", {"event": "stop_update", "mode": "live", "id": position_id, **result})
+                self._save()
+                return result
             for position in self.book.paper_positions:
                 if position["id"] == position_id:
                     result = propose_stop_update(position["direction"], position["stop_loss"], new_stop)
                     if result["accepted"]:
                         position["stop_loss"] = result["stop"]
                     self.journal.record("execution", {"event": "stop_update", "id": position_id, **result})
+                    self._save()
                     return result
             return {"accepted": False, "reason": "Unknown paper position."}
 
@@ -288,14 +486,37 @@ class TradingService:
         with self.lock:
             result = self.book.set_mode(mode)
             self.journal.record("mode_change", result)
+            self._save()
             return result
 
-    def request_live(self, checklist: LiveChecklist) -> dict:
+    def request_live(self, checklist: LiveChecklist, note: str = "Operator requested live mode.") -> dict:
+        """Arm live mode. Every item must hold on BOTH sides: the operator's request and the configuration.
+        Broker connectivity is never taken from the request: the adapter must check out right now."""
         with self.lock:
-            # The operator payload cannot assert broker connectivity on its own:
-            # the configured adapter must also report ready.
-            result = self.book.request_live(checklist)
-            self.journal.record("mode_change", result, note="Operator requested live mode.")
+            s = self.settings
+            if self.broker is not None:
+                self.broker.check()
+            combined = LiveChecklist(
+                explicit_authorization=bool(checklist.explicit_authorization and s.live_trading_authorized),
+                broker_connected=bool(self.broker is not None and self.broker.ready),
+                account_risk_limits_set=bool(checklist.account_risk_limits_set),
+                emergency_shutdown_armed=bool(checklist.emergency_shutdown_armed and s.emergency_shutdown_armed),
+            )
+            if self.account.emergency_shutdown:
+                result = {"accepted": False, "live_enabled": False, "orders_sent": 0, "missing": ["emergency shutdown must be cleared first"]}
+            else:
+                result = self.book.request_live(combined)
+            hints = []
+            if not s.live_trading_authorized:
+                hints.append("Set LIVE_TRADING_AUTHORIZED=true in .env and restart.")
+            if self.broker is None:
+                hints.append("Set BROKER_ADAPTER=mt5 in .env and restart.")
+            elif not self.broker.ready:
+                hints.extend(self.broker.status.get("reasons", []))
+            result["hints"] = hints
+            result["broker"] = None if self.broker is None else self.broker.status
+            self.journal.record("mode_change", result, note=note)
+            self._save()
             return result
 
     def emergency_shutdown(self, reason: str) -> dict:
@@ -309,12 +530,24 @@ class TradingService:
                 for row in closed:
                     register_closed_trade(self.account, row["pnl"], self.settings)
                     self.journal.record("execution", row)
-            self.account.open_positions = []
             self.book.live_enabled = False
             if self.book.mode == "live":
                 self.book.mode = "analysis"
-            result = {"emergency_shutdown": True, "flattened": len(closed), "reason": reason, "mode": self.book.mode}
+            live_results = []
+            if self.broker is not None and self.live_positions:
+                live_results = self._close_all_live(f"emergency shutdown: {reason}")
+                closed += self.reconcile_live()
+            self.account.open_positions = self._open_positions()
+            result = {
+                "emergency_shutdown": True,
+                "flattened": len(closed),
+                "live_close_requests": live_results,
+                "live_still_open": list(self.live_positions),
+                "reason": reason,
+                "mode": self.book.mode,
+            }
             self.journal.record("emergency", result)
+            self._save()
             return to_jsonable(result)
 
     def reset_emergency(self, operator: str, acknowledgement: str) -> dict:
@@ -324,6 +557,7 @@ class TradingService:
             self.account.emergency_shutdown = False
             result = {"reset": True, "operator": operator}
             self.journal.record("emergency", result, note="Emergency shutdown cleared by operator.")
+            self._save()
             return result
 
     def acknowledge_loss_pause(self, operator: str) -> dict:
@@ -332,6 +566,7 @@ class TradingService:
             self.account.consecutive_losses = 0
             result = {"loss_pause": False, "operator": operator, "note": "Position size is unchanged after the pause."}
             self.journal.record("operator_note", result, note="Consecutive-loss pause acknowledged.")
+            self._save()
             return result
 
     # ------------------------------------------------------------------ risk
@@ -339,7 +574,8 @@ class TradingService:
         with self.lock:
             moment = datetime.now(timezone.utc)
             roll_account_clock(self.account, moment)
-            open_risk = sum(float(p.get("risk_amount", 0.0)) for p in self.book.paper_positions)
+            open_rows = self._open_positions()
+            open_risk = sum(float(p.get("risk_amount", 0.0)) for p in open_rows)
             equity = self.account.equity
             return to_jsonable(
                 {
@@ -354,7 +590,7 @@ class TradingService:
                     "weekly_drawdown_pct": round(max(0.0, (self.account.week_start_equity - equity) / self.account.week_start_equity * 100), 3)
                     if self.account.week_start_equity
                     else 0.0,
-                    "open_positions": self.book.paper_positions,
+                    "open_positions": open_rows,
                     "open_risk_amount": round(open_risk, 2),
                     "open_risk_pct": round(open_risk / equity * 100, 3) if equity else 0.0,
                     "consecutive_losses": self.account.consecutive_losses,

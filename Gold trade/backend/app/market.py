@@ -9,6 +9,7 @@ keeps the rest of the system testable.
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,6 +19,8 @@ import pandas as pd
 from app.frames import PriceFrame, resample_frame, validate_frame
 
 TIMEFRAMES = ("MN1", "W1", "D1", "H4", "H1", "M15", "M5")
+# One lock for every MetaTrader 5 call (price feed and orders share the terminal connection).
+MT5_LOCK = threading.RLock()
 
 
 class MarketDataEngine:
@@ -202,6 +205,10 @@ class MT5Feed:
         offset_hours: float | None = None,
         offset_cache: Path | None = None,
     ) -> PriceFrame:
+        with MT5_LOCK:
+            return self._copy_m5_locked(symbol, login, password, server, count, terminal_path, offset_hours, offset_cache)
+
+    def _copy_m5_locked(self, symbol, login, password, server, count, terminal_path, offset_hours, offset_cache) -> PriceFrame:
         mt5 = self.connect(login, password, server, terminal_path)
         try:
             info = self.resolve_symbol(mt5, symbol)

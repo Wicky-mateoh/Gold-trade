@@ -25,7 +25,14 @@ class Settings(BaseSettings):
     live_trading_authorized: bool = False
     broker_connected: bool = False
     emergency_shutdown_armed: bool = True
+    # none = no order routing; mt5 = MetaTrader 5 order adapter (demo accounts only unless allowed below)
     broker_adapter: str = "none"
+    # Real-money accounts stay locked until this is true AND live mode is armed through the checklist.
+    allow_real_account: bool = False
+    # Hard cap on every live order, regardless of the risk sizing.
+    live_max_lots: float = 0.01
+    # Magic number that marks this bot's orders on MT5.
+    live_magic: int = 7319001
 
     database_url: str = ""
     redis_url: str = ""

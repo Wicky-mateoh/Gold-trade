@@ -23,6 +23,11 @@ export const api = {
   backtest: (timeframe) => request("/api/backtest", { method: "POST", body: JSON.stringify({ timeframe }) }),
   latestBacktest: () => request("/api/backtest/latest"),
   setMode: (mode) => request("/api/mode", { method: "POST", body: JSON.stringify({ mode }) }),
+  requestLive: () =>
+    request("/api/live/request", {
+      method: "POST",
+      body: JSON.stringify({ explicit_authorization: true, broker_connected: true, account_risk_limits_set: true, emergency_shutdown_armed: true }),
+    }),
   markPaper: () => request("/api/paper/mark", { method: "POST" }),
   shutdown: (reason) => request("/api/emergency/shutdown", { method: "POST", body: JSON.stringify({ reason }) }),
   resetShutdown: (operator, acknowledgement) =>

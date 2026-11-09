@@ -107,6 +107,68 @@ What the bot does with MT5: every `AUTO_CYCLE_SECONDS` (default 60) it reads the
 **closed** M5 bars, converts broker server time to UTC, and runs analysis and simulated
 trading. It never sends orders to your account.
 
+## Running unattended on Windows
+
+```bat
+powershell -ExecutionPolicy Bypass -File scripts\windows\install_autostart.ps1
+```
+
+This registers a Windows scheduled task that starts `scripts\windows\run_gits.bat` at your
+logon. The batch file restarts the server 15 seconds after any exit. MT5 needs a logged-in
+desktop, so on a PC or VPS that must survive reboots, also turn on automatic sign-in for that
+Windows account. Remove the task with `scripts\windows\uninstall_autostart.ps1`.
+
+**State survives restarts.** `var/state.json` holds the account balance, the day and week
+anchors, the loss-streak pause, the emergency stop, the mode, open simulated positions and
+tracked live positions. It is rewritten atomically after every change. On restart the bot
+journals "State restored after restart". **Live mode is never restored automatically**: it
+comes back as paper and must be re-armed from the dashboard. Live positions stay tracked, so
+broker-side stop and target fills are still recorded.
+
+Logs: `var/logs/gits.log` (rotating, 5 x 5 MB), plus `server.out` and `supervisor.log`
+from the batch runner.
+
+## Stage 3: real orders on an MT5 demo account
+
+Only after the paper-trading stage. Every one of these is required:
+
+1. Log in to MT5 with the account's **master (trading) password**; the investor password
+   cannot trade. Use a **demo** account.
+2. Click **Algo Trading** in the MT5 toolbar so it turns green.
+3. In `.env`:
+
+   ```ini
+   BROKER_ADAPTER=mt5
+   LIVE_TRADING_AUTHORIZED=true
+   LIVE_MAX_LOTS=0.01
+   ALLOW_REAL_ACCOUNT=false
+   ```
+
+4. Restart the bot. The header shows **MT5 demo ready**. If it doesn't, the banner lists why
+   (Algo Trading off, investor password, real account, wrong symbol...).
+5. Press **live** on the dashboard and type the confirmation phrase.
+
+What the connector guarantees:
+
+* **Demo only:** a real-money account is refused unless `ALLOW_REAL_ACCOUNT=true`, and this
+  is checked again before every order.
+* **Broker-side protection:** every order carries its stop-loss and take-profit. If a fill
+  comes back without its stop, the stop is re-sent; if that fails, the position is closed.
+* **Lot cap:** `LIVE_MAX_LOTS` applies after the risk sizing.
+* **No duplicates:** each order is tagged (`magic` + `gits:<id>`) and checked against open
+  positions and recent deal history before sending.
+* **Slippage:** the fill must sit within the entry zone ± `MAX_SLIPPAGE`, and MT5's
+  `deviation` enforces the same limit on the server.
+* **Reconciliation:** each cycle reads MT5 positions. Broker stop, target and stop-out fills
+  are journaled with the real P&L from deal history, equity is taken from the broker, and
+  any position carrying the bot's magic number is adopted.
+* **Closes:** the emergency stop, the pre-NFP/CPI flatten and the max hold close live
+  positions on MT5.
+
+Run the demo stage for several weeks. Check the journal for any `rejected`, `refused`,
+`close_failed` or `closed_unprotected` events, and compare live fills with the paper
+results. Only then consider `ALLOW_REAL_ACCOUNT=true`, at the minimum lot size.
+
 ## NFP & CPI calendar
 
 The built-in schedule protects NFP and CPI with no setup. For confirmed dates plus
@@ -127,7 +189,8 @@ Position size depends on them directly.
 
 ## Path to live: a review, not a switch
 
-Live execution needs **all** of the following. The software enforces each one:
+Live execution needs **all** of the following. The software enforces each one
+(see *Stage 3* above for the MT5 demo procedure):
 
 1. `LIVE_TRADING_AUTHORIZED=true`. This is explicit operator authorization.
 2. `BROKER_CONNECTED=true`, backed by a real connectivity check in the adapter.

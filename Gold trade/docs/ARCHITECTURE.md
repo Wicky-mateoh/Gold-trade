@@ -78,7 +78,7 @@ The calendar never predicts which way the number will move gold.
 | 9 | Backtesting | `backtest.py` | Fills at the next bar's open plus half the spread and slippage. When stop and target are touched in the same bar, the stop is assumed hit. Commission is per lot. Higher-TF bias is read only from bars that had **closed** before the entry bar closed. Reports win rate, PF, return, max DD, average R:R, Sharpe, Sortino, expectancy, streaks, results by session and regime, and Monte Carlo reshuffles. `validate_out_of_sample` runs one development segment and four sequential out-of-sample segments, each starting from fresh equity. |
 | 10 | Learning | `learning.py`, `service.learning_view` | Calibration table, drift detection, regime labels, and a draft logistic classifier that is never deployed automatically. `ModelRegistry` keeps an audit trail and only promotes a version after walk-forward passes. `filter_recommendations` strips any risk-limit keys. |
 | 11 | Dashboard | `frontend/` | React with TradingView lightweight-charts. Live updates over WebSocket, plus toast and browser notifications when the decision changes. |
-| 12 | Execution & safety | `execution.py`, `service.py`, `journal.py` | Starts in `analysis` mode; `paper` is available. The API refuses `live` (schema) and `request_live` requires every checklist item **and** an adapter with `ready=True`. The default adapter is never ready. Emergency stop flattens paper positions and needs a typed acknowledgement to reset. Every signal, rejection, risk decision, mode change and fill is journaled. |
+| 12 | Execution & safety | `execution.py`, `broker_mt5.py`, `state.py`, `service.py`, `journal.py` | Starts in `analysis` mode; `paper` is available. The API refuses `live` (schema) and `request_live` requires every checklist item **and** an adapter with `ready=True`. The default adapter is never ready. Emergency stop flattens paper positions and needs a typed acknowledgement to reset. Every signal, rejection, risk decision, mode change and fill is journaled. |
 
 ## Safety invariants (enforced by tests)
 
@@ -115,6 +115,24 @@ The calendar never predicts which way the number will move gold.
 | WS | `/ws/stream` | Preview evaluation every `STREAM_INTERVAL_SECONDS` (never opens positions) |
 
 Interactive docs are available at `/docs` while the server runs.
+
+## Live execution (MT5)
+
+`broker_mt5.py` is the only code that can place orders. It runs only when
+`BROKER_ADAPTER=mt5` and live mode has been armed: the operator's dashboard confirmation,
+`LIVE_TRADING_AUTHORIZED=true`, an armed emergency stop, no active emergency, and an adapter
+check that passes at that moment. The adapter refuses real-money accounts unless
+`ALLOW_REAL_ACCOUNT=true`, caps lots at `LIVE_MAX_LOTS`, sends broker-side SL/TP with every
+order (closing the position if a stop cannot be attached), tags orders to prevent duplicates,
+and never widens a stop. `service.reconcile_live()` treats MT5 as the source of truth for
+open positions, realized P&L and equity. All MT5 calls share one lock with the price feed.
+
+## Durable state
+
+`state.py` writes `var/state.json` atomically after every change: account, anchors, loss
+pause, emergency stop, mode, and open paper and live positions. Startup restores it; live
+mode is never restored and must be re-armed. A corrupt file is set aside, and the bot starts
+fresh with the journal intact.
 
 ## Known limitations
 

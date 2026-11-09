@@ -7,12 +7,14 @@ slippage. A result on synthetic data is a software check, not an edge.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 
 from app.indicators import adx, atr, ema, macd, rsi, volume_ratio
+from app.learning import regime_label
 from app.risk import AccountState, OrderProposal, assess, register_closed_trade
 from app.sessions import session_at
 from app.signals import MarketContext, decide, fibonacci_for_context
@@ -25,11 +27,28 @@ class CostModel:
     slippage: float = 0.05
 
 
-def run_backtest(frame, settings, costs: CostModel | None = None, warmup: int = 220) -> dict:
+BAR_DURATION = {
+    "M5": pd.Timedelta(minutes=5),
+    "M15": pd.Timedelta(minutes=15),
+    "H1": pd.Timedelta(hours=1),
+    "H4": pd.Timedelta(hours=4),
+    "D1": pd.Timedelta(days=1),
+}
+
+
+def run_backtest(frame, settings, costs: CostModel | None = None, warmup: int = 220, higher: dict | None = None) -> dict:
+    """Replay the signal and risk gates bar by bar.
+
+    `higher` maps timeframe -> PriceFrame (e.g. {"D1": ..., "H4": ...}). When
+    supplied, each higher-timeframe bias is read only from bars that had fully
+    closed before the current entry bar closed, so there is no look-ahead.
+    Without it, the entry frame's own bias stands in for every timeframe.
+    """
     costs = costs or CostModel()
     if len(frame) <= warmup + 2:
         return _empty("History is shorter than the warmup window.")
     features = _features(frame)
+    htf = _higher_features(frame, higher or {})
     account = AccountState(settings.account_equity, settings.account_equity, settings.account_equity)
     trades: list[dict] = []
     open_trade: dict | None = None
@@ -43,7 +62,7 @@ def run_backtest(frame, settings, costs: CostModel | None = None, warmup: int = 
                 trades.append(closed)
                 open_trade = None
         if open_trade is None and not account.loss_pause and not account.emergency_shutdown:
-            context = _context_at(frame, features, i, settings.instrument)
+            context = _context_at(frame, features, i, settings.instrument, htf)
             signal = decide(context, settings.min_signal_confidence, settings.min_reward_risk, settings.max_spread)
             if signal["actionable"]:
                 proposal = OrderProposal(
@@ -57,6 +76,10 @@ def run_backtest(frame, settings, costs: CostModel | None = None, warmup: int = 
                 decision = assess(proposal, account, settings)
                 if decision["approved"]:
                     open_trade = _open_from_next(signal, frame, i + 1, decision, costs)
+                    open_trade["regime"] = regime_label(context.adx, context.volatility)
+                    open_trade["confidence"] = signal["confidence"]
+                    open_trade["atr"] = context.atr
+                    open_trade["opened_at"] = pd.Timestamp(frame.time[i + 1]).isoformat()
         equity_curve.append(account.equity if open_trade is None else account.equity + _unrealized(open_trade, frame, i, settings.contract_ounces))
     metrics = compute_metrics(trades, equity_curve, frame)
     return {
@@ -205,21 +228,68 @@ def _features(frame) -> dict:
     }
 
 
-def _context_at(frame, features: dict, index: int, instrument: str) -> MarketContext:
-    visible_high = [i for i in features["highs"] if i + 3 <= index]
-    visible_low = [i for i in features["lows"] if i + 3 <= index]
-    bias = "unknown"
-    if len(visible_high) >= 2 and len(visible_low) >= 2:
-        hh = frame.high[visible_high[-1]] > frame.high[visible_high[-2]]
-        hl = frame.low[visible_low[-1]] > frame.low[visible_low[-2]]
-        lh = frame.high[visible_high[-1]] < frame.high[visible_high[-2]]
-        ll = frame.low[visible_low[-1]] < frame.low[visible_low[-2]]
-        if hh and hl:
-            bias = "bullish"
-        elif lh and ll:
-            bias = "bearish"
-        else:
-            bias = "ranging"
+def _visible_swings(features: dict, index: int) -> tuple[list[int], list[int]]:
+    # Swings are confirmed three bars later, so only swings with i + 3 <= index are visible.
+    return (
+        features["highs"][: bisect_right(features["highs"], index - 3)],
+        features["lows"][: bisect_right(features["lows"], index - 3)],
+    )
+
+
+def _bias_from(frame, visible_high: list[int], visible_low: list[int]) -> str:
+    if len(visible_high) < 2 or len(visible_low) < 2:
+        return "unknown"
+    hh = frame.high[visible_high[-1]] > frame.high[visible_high[-2]]
+    hl = frame.low[visible_low[-1]] > frame.low[visible_low[-2]]
+    lh = frame.high[visible_high[-1]] < frame.high[visible_high[-2]]
+    ll = frame.low[visible_low[-1]] < frame.low[visible_low[-2]]
+    if hh and hl:
+        return "bullish"
+    if lh and ll:
+        return "bearish"
+    return "ranging"
+
+
+def _higher_features(entry, higher: dict) -> dict:
+    out = {}
+    entry_step = BAR_DURATION.get(entry.timeframe)
+    if entry_step is None:
+        return out
+    entry_close = pd.DatetimeIndex(entry.time) + entry_step
+    for timeframe, frame in higher.items():
+        step = BAR_DURATION.get(timeframe)
+        if frame is None or len(frame) == 0 or step is None:
+            continue
+        ends = (pd.DatetimeIndex(frame.time) + step).to_numpy()
+        # completed[i] = number of higher bars closed at or before entry bar i closes.
+        completed = np.searchsorted(ends, entry_close.to_numpy(), side="right")
+        highs, lows = find_swings(frame.high, frame.low, 3, 3)
+        out[timeframe] = {"frame": frame, "completed": completed, "highs": highs, "lows": lows}
+    return out
+
+
+def _higher_bias(htf: dict, timeframe: str, index: int) -> str | None:
+    row = htf.get(timeframe)
+    if row is None:
+        return None
+    last = int(row["completed"][index]) - 1
+    if last < 0:
+        return "unknown"
+    vh, vl = _visible_swings(row, last)
+    return _bias_from(row["frame"], vh, vl)
+
+
+def _context_at(frame, features: dict, index: int, instrument: str, htf: dict | None = None) -> MarketContext:
+    visible_high, visible_low = _visible_swings(features, index)
+    bias = _bias_from(frame, visible_high, visible_low)
+    biases = {"D1": bias, "H4": bias, "H1": bias, "M15": bias}
+    biases[frame.timeframe] = bias
+    for timeframe in ("D1", "H4", "H1"):
+        higher_bias = _higher_bias(htf or {}, timeframe, index)
+        if higher_bias is not None:
+            biases[timeframe] = higher_bias
+    directional = [biases[tf] for tf in ("D1", "H4", "H1") if biases[tf] in {"bullish", "bearish"}]
+    conflict = "bullish" in directional and "bearish" in directional
     event = None
     if bias == "bullish" and visible_low and frame.close[index] < frame.low[visible_low[-1]]:
         event = "choch_bearish"
@@ -261,8 +331,8 @@ def _context_at(frame, features: dict, index: int, instrument: str) -> MarketCon
         price=float(frame.close[index]),
         spread=None if np.isnan(spread) else float(spread),
         atr=None if not np.isfinite(atr_v) else float(atr_v),
-        biases={"D1": bias, "H4": bias, "H1": bias, "M15": bias},
-        conflict=False,
+        biases=biases,
+        conflict=conflict,
         structure_event=event,
         regime=bias if bias in {"bullish", "bearish"} else "consolidation",
         premium_discount=zone,
@@ -322,7 +392,7 @@ def _open_from_next(signal: dict, frame, index: int, decision: dict, costs: Cost
         "reward_risk": signal["reward_risk"],
         "opened_index": index,
         "session": decision["session"],
-        "regime": signal.get("candidate_direction"),
+        "regime": "unknown",
         "commission": costs.commission_per_lot * decision["lots"],
     }
 
@@ -347,7 +417,7 @@ def _try_exit(trade: dict, frame, index: int, costs: CostModel, ounces: float) -
         "pnl": round(float(pnl), 2),
         "closed_index": index,
         "outcome": "loss" if pnl < 0 else "win",
-        "regime": "trend",
+        "closed_at": pd.Timestamp(frame.time[index]).isoformat(),
     }
 
 
@@ -422,3 +492,77 @@ def _empty(note: str) -> dict:
         "deployment_gate": {"passed": False, "reasons": [note], "live_permission": False, "statement": note},
         "note": note,
     }
+
+
+def validate_out_of_sample(frame, settings, costs: CostModel | None = None, folds: int = 4, warmup: int = 220, higher: dict | None = None) -> dict:
+    """Walk-forward over sequential, non-overlapping time segments.
+
+    The rule set has no fitted parameters, so the first segment is the
+    development window and every later segment is out of sample. Each segment
+    starts from fresh equity and only sees bars up to its own end, so later
+    data cannot leak into an earlier result.
+    """
+    n = len(frame)
+    segment = n // (folds + 1)
+    if segment <= warmup + 50:
+        return {"segments": [], "passed": False, "reasons": ["History is too short for walk-forward segments."]}
+    rows = []
+    oos_trades: list[dict] = []
+    for fold in range(folds + 1):
+        start = max(0, fold * segment - warmup)
+        end = n if fold == folds else (fold + 1) * segment
+        piece = _segment(frame, start, end)
+        result = run_backtest(piece, settings, costs, warmup=warmup, higher=higher)
+        metrics = result["metrics"]
+        role = "development" if fold == 0 else "out_of_sample"
+        if role == "out_of_sample":
+            oos_trades.extend(result["trades"])
+        rows.append(
+            {
+                "segment": fold + 1,
+                "role": role,
+                "start": pd.Timestamp(piece.time[0]).isoformat(),
+                "end": pd.Timestamp(piece.time[-1]).isoformat(),
+                "trades": metrics["trades"],
+                "net_return_pct": metrics["net_return_pct"],
+                "profit_factor": metrics["profit_factor"],
+                "win_rate": metrics["win_rate"],
+                "max_drawdown_pct": metrics["max_drawdown_pct"],
+            }
+        )
+    oos = [row for row in rows if row["role"] == "out_of_sample"]
+    reasons = []
+    positive = sum(1 for row in oos if row["net_return_pct"] > 0)
+    if len(oos_trades) < 30:
+        reasons.append(f"Out-of-sample segments produced {len(oos_trades)} trades; 30 are required.")
+    if positive < max(1, int(np.ceil(len(oos) * 0.75))):
+        reasons.append(f"Only {positive} of {len(oos)} out-of-sample segments were net positive.")
+    pnls = np.array([trade["pnl"] for trade in oos_trades], dtype=float)
+    if len(pnls):
+        gross_loss = abs(float(pnls[pnls < 0].sum()))
+        gross_profit = float(pnls[pnls > 0].sum())
+        if gross_loss == 0 or gross_profit / gross_loss < 1.1:
+            reasons.append("Pooled out-of-sample profit factor is below 1.1.")
+    return {
+        "segments": rows,
+        "out_of_sample_trades": len(oos_trades),
+        "passed": not reasons,
+        "reasons": reasons or ["Every robustness check on the out-of-sample segments passed."],
+        "live_permission": False,
+        "statement": "Passing walk-forward is a precondition for a live review, not a forecast of returns.",
+    }
+
+
+def _segment(frame, start: int, end: int):
+    from app.frames import PriceFrame
+
+    return PriceFrame(
+        frame.timeframe,
+        frame.time[start:end],
+        frame.open[start:end],
+        frame.high[start:end],
+        frame.low[start:end],
+        frame.close[start:end],
+        frame.volume[start:end],
+        frame.spread[start:end],
+    )

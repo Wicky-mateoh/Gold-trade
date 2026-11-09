@@ -1,0 +1,12 @@
+[
+  {"published_at": "2026-08-13T13:05:00Z", "source": "reuters", "importance": "high",
+   "headline": "EXAMPLE: Treasury yields fall after softer inflation print, weaker dollar follows"},
+  {"published_at": "2026-08-13T16:40:00Z", "source": "world_gold_council", "importance": "medium",
+   "headline": "EXAMPLE: Central bank buying remained firm in the second quarter"},
+  {"published_at": "2026-08-14T09:15:00Z", "source": "bloomberg", "importance": "medium",
+   "headline": "EXAMPLE: Fed speakers sound hawkish, see no rush to ease"},
+  {"published_at": "2026-08-14T11:00:00Z", "source": "financial_times", "importance": "low",
+   "headline": "EXAMPLE: Market reaction to geopolitical headlines is mixed and unclear"},
+  {"published_at": "2026-08-14T12:00:00Z", "source": "social_media", "importance": "high",
+   "headline": "EXAMPLE: Rumour says rate cut is coming tomorrow"}
+]

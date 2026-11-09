@@ -113,12 +113,12 @@ def classify_news(item: NewsItem) -> dict:
     }
 
 
-def load_news_directory(path: Path) -> list[NewsItem]:
+def load_news_directory(path: Path, include_examples: bool = False) -> list[NewsItem]:
     if not path.exists():
         return []
     items: list[NewsItem] = []
     for file in sorted(path.glob("*.json")):
-        if file.name.endswith(".example.json"):
+        if file.name.endswith(".example.json") != include_examples:
             continue
         payload = json.loads(file.read_text(encoding="utf-8"))
         rows = payload if isinstance(payload, list) else [payload]

@@ -1,0 +1,8 @@
+.env
+var/
+__pycache__/
+*.pyc
+.pytest_cache/
+frontend/node_modules/
+frontend/dist/
+data/*_M5.csv

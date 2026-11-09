@@ -34,7 +34,8 @@ def load_calendar(path: Path) -> list[EconomicEvent]:
         reader = csv.DictReader(handle)
         for row in reader:
             name = (row.get("name") or "").strip()
-            if not name or name.startswith("#"):
+            stamp_text = (row.get("timestamp_utc") or "").strip()
+            if not name or name.startswith("#") or not stamp_text or stamp_text.startswith("#"):
                 continue
             stamp = pd.Timestamp(row["timestamp_utc"])
             if stamp.tzinfo is None:

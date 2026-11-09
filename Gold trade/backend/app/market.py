@@ -100,7 +100,7 @@ def synthetic_m5(days: int = 420, seed: int = 42, start: str = "2025-01-06T00:00
     spread = np.full(n, 0.24)
     return PriceFrame(
         "M5",
-        np.array(times, dtype="datetime64[ns]"),
+        pd.DatetimeIndex(times),
         open_,
         high,
         low,

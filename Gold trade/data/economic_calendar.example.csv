@@ -1,0 +1,16 @@
+timestamp_utc,name,impact,category,source
+# EXAMPLE ROWS ONLY. Dates are illustrative and must be replaced from an official schedule
+# (federalreserve.gov, bls.gov, bea.gov) before use. Copy to economic_calendar.csv to activate.
+2026-08-12T12:30:00Z,US CPI (example),high,inflation,example_calendar
+2026-08-13T12:30:00Z,US PPI (example),high,inflation,example_calendar
+2026-08-13T12:30:00Z,US Initial Jobless Claims (example),medium,employment,example_calendar
+2026-08-15T00:00:00Z,US 10Y Treasury auction (example),medium,yields,example_calendar
+2026-08-17T14:00:00Z,DXY weekly review (example),low,dollar,example_calendar
+2026-08-19T18:00:00Z,FOMC Minutes (example),high,fed,example_calendar
+2026-08-21T14:00:00Z,Fed Chair speech (example),high,fed,example_calendar
+2026-08-27T12:30:00Z,US GDP second estimate (example),high,growth,example_calendar
+2026-08-28T12:30:00Z,US Core PCE (example),high,inflation,example_calendar
+2026-09-04T12:30:00Z,US Non-Farm Payrolls (example),high,employment,example_calendar
+2026-09-04T12:30:00Z,US Unemployment Rate (example),high,employment,example_calendar
+2026-09-07T09:00:00Z,World Gold Council central bank demand (example),medium,central_bank_gold,example_calendar
+2026-09-16T18:00:00Z,FOMC Rate Decision (example),high,fed,example_calendar

@@ -100,7 +100,7 @@ class Journal:
 
     def signal_accuracy(self) -> dict:
         """Score closed paper/backtest trades against the confidence attached at entry."""
-        closes = [row["payload"] for row in self.rows if row["kind"] == "execution" and row["payload"].get("event") in {"close", "emergency_flatten"}]
+        closes = [row["payload"] for row in self.rows if row["kind"] == "execution" and row["payload"].get("event") in {"close", "emergency_flatten", "event_flatten"}]
         if not closes:
             return {"closed": 0, "wins": 0, "win_rate": None, "net": 0.0}
         wins = sum(1 for row in closes if float(row.get("pnl", 0)) > 0)

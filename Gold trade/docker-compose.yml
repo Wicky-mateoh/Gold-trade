@@ -28,7 +28,7 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://gits:gits@postgres:5432/gits
       REDIS_URL: redis://redis:6379/0
-      APP_MODE: analysis
+      APP_MODE: paper
       LIVE_TRADING_AUTHORIZED: "false"
     ports:
       - "8000:8000"

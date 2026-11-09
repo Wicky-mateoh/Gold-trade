@@ -11,9 +11,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # Empty values in .env (e.g. "DXY_SESSION_CHANGE=") mean "not set", not "".
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", env_ignore_empty=True)
 
-    app_mode: str = "analysis"
+    # Analysis + simulated (paper) trading is the operating default.
+    app_mode: str = "paper"
+    # intraday: D1/H4 direction, H1 confirmation, M15 entry.
+    # scalping: H4/H1 direction, M15 confirmation and entry, short holds.
+    strategy_profile: str = "intraday"
     instrument: str = "XAUUSD"
     account_equity: float = 100_000.0
 
@@ -43,6 +48,16 @@ class Settings(BaseSettings):
     macro_blackout_before_min: int = 30
     macro_blackout_after_min: int = 15
     min_signal_confidence: float = 62.0
+    # Spread may use at most this share of the stop distance (protects short-stop scalps).
+    max_spread_stop_ratio: float = 0.2
+
+    # Tier-1 releases (NFP, CPI): wider no-new-risk window and a pre-release flatten.
+    tier1_blackout_before_min: int = 60
+    tier1_blackout_after_min: int = 60
+    flatten_before_tier1_min: int = 15
+    # Optional JSON calendar feed (ForexFactory-style rows). Empty = file + built-in schedule only.
+    calendar_feed_url: str = ""
+    calendar_refresh_minutes: int = 60
 
     dxy_session_change: float | None = None
     us10y_session_change: float | None = None
@@ -58,6 +73,14 @@ class Settings(BaseSettings):
         normalized = value.strip().lower()
         if normalized not in allowed:
             raise ValueError(f"APP_MODE must be one of {sorted(allowed)}")
+        return normalized
+
+    @field_validator("strategy_profile")
+    @classmethod
+    def _profile(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"intraday", "scalping"}:
+            raise ValueError("STRATEGY_PROFILE must be intraday or scalping")
         return normalized
 
     @property
@@ -78,6 +101,10 @@ class Settings(BaseSettings):
             "min_reward_risk": self.min_reward_risk,
             "max_consecutive_losses": self.max_consecutive_losses,
             "allowed_sessions": ",".join(sorted(self.session_allowlist)),
+            "max_spread_stop_ratio": self.max_spread_stop_ratio,
+            "tier1_blackout_before_min": self.tier1_blackout_before_min,
+            "tier1_blackout_after_min": self.tier1_blackout_after_min,
+            "flatten_before_tier1_min": self.flatten_before_tier1_min,
         }
 
 

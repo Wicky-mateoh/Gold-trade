@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -61,7 +62,8 @@ class StopUpdate(BaseModel):
 
 
 class BacktestRequest(BaseModel):
-    timeframe: str = Field(default="H1", pattern="^(M15|H1|H4|D1)$")
+    # Default: the strategy profile's entry timeframe (M15 for intraday and scalping).
+    timeframe: str | None = Field(default=None, pattern="^(M15|H1|H4|D1)$")
     commission_per_lot: float = Field(default=3.5, ge=0)
     slippage: float = Field(default=0.05, ge=0)
 
@@ -78,13 +80,30 @@ class PromoteRequest(BaseModel):
     version: str
 
 
+async def _autonomous(svc: TradingService, interval: float) -> None:
+    """Background loop so the bot keeps working with no dashboard open."""
+    log = logging.getLogger("gits.cycle")
+    while True:
+        try:
+            result = await asyncio.to_thread(svc.cycle)
+            if result["evaluated"]:
+                log.info("Cycle evaluated: %s", result.get("decision"))
+        except Exception:  # keep the loop alive; the failure is in the log
+            log.exception("Autonomous cycle failed")
+        await asyncio.sleep(interval)
+
+
 def create_app(service: TradingService | None = None) -> FastAPI:
     holder: dict[str, TradingService] = {}
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         holder["svc"] = service or TradingService(load_settings(), ROOT)
+        interval = float(os.environ.get("AUTO_CYCLE_SECONDS", "60"))
+        task = asyncio.create_task(_autonomous(holder["svc"], interval)) if interval > 0 and service is None else None
         yield
+        if task:
+            task.cancel()
 
     app = FastAPI(title="Gold Intelligence Trading System", version=__version__, lifespan=lifespan)
     origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", "http://localhost:5173").split(",") if o.strip()]
@@ -121,6 +140,15 @@ def create_app(service: TradingService | None = None) -> FastAPI:
     def calendar():
         return svc().analysis()["macro"]
 
+    @app.get("/api/tier1")
+    def tier1():
+        """NFP and CPI monitor: next release, confirmed or estimated, blackout and flatten state."""
+        return svc().analysis()["tier1"]
+
+    @app.post("/api/calendar/refresh")
+    def calendar_refresh():
+        return svc().calendar.refresh(force=True)
+
     @app.get("/api/news")
     def news():
         return svc().analysis()["sentiment"]
@@ -148,6 +176,10 @@ def create_app(service: TradingService | None = None) -> FastAPI:
     @app.post("/api/live/request")
     def live(body: LiveRequest):
         return svc().request_live(LiveChecklist(**body.model_dump()))
+
+    @app.post("/api/data/refresh")
+    def refresh():
+        return svc().cycle()
 
     @app.post("/api/paper/mark")
     def mark():

@@ -76,6 +76,9 @@ def test_sessions():
     assert session_at(pd.Timestamp("2025-01-06T14:00Z")) == "london_new_york_overlap"
     assert session_at(pd.Timestamp("2025-01-06T18:00Z")) == "new_york"
     assert session_at(pd.Timestamp("2025-01-06T23:00Z")) == "off"
+    assert session_at(pd.Timestamp("2025-01-10T22:30Z")) == "closed"  # Friday after the close
+    assert session_at(pd.Timestamp("2025-01-11T12:00Z")) == "closed"  # Saturday
+    assert session_at(pd.Timestamp("2025-01-12T23:00Z")) == "off"     # Sunday reopen
 
 
 def test_engine_rejects_bad_base():

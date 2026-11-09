@@ -5,6 +5,11 @@ structure, Smart Money Concepts, technical indicators, a macro calendar, and new
 into a signal gate that returns **BUY**, **SELL**, or **NO TRADE**. An independent risk engine
 then approves or rejects each proposal.
 
+**Configured for:** MetaTrader 5 data · analysis + simulated trading · M15/H1/H4/D1 ·
+0.5% risk per simulated trade · intraday profile (scalping available) · Python + React ·
+automatic NFP and CPI protection (no new trades around the release; open trades close
+before it).
+
 > **No guarantee of profit.** Every signal carries its evidence, a calibrated confidence score,
 > invalidation conditions, and risk parameters. Live order routing is **locked by default**.
 > It needs explicit authorization, validated broker connectivity, account risk limits, an armed

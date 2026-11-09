@@ -10,6 +10,7 @@ import {
   LiquidityPanel,
   MtfTable,
   NewsPanel,
+  NfpCpiPanel,
   PerformancePanel,
   RiskPanel,
   SignalPanel,
@@ -99,7 +100,7 @@ export default function App() {
   const runBacktest = async () => {
     setRunning(true);
     try {
-      const r = await api.backtest("H1");
+      const r = await api.backtest();
       setBacktest(r);
       setLearning(await api.learning());
       notify(`Backtest done: ${r.metrics.trades} trades, walk-forward ${r.out_of_sample.passed ? "passed" : "not passed"}`, "info");
@@ -133,7 +134,9 @@ export default function App() {
           <span className="logo">Au</span>
           <div>
             <h1>Gold Intelligence Trading System</h1>
-            <p className="sub">XAU/USD · {status?.data_source || "…"} data · {status?.mode || "…"} mode</p>
+            <p className="sub">
+              XAU/USD · {status?.data_source || "…"} data · {status?.mode === "paper" ? "analysis + simulated trading" : `${status?.mode || "…"} mode`} · {analysis?.profile ? `${analysis.profile.name} (${analysis.profile.primary}/${analysis.profile.secondary} → ${analysis.profile.confirm} → ${analysis.profile.entry})` : "…"}
+            </p>
           </div>
         </div>
         <div className="ticker">
@@ -144,6 +147,7 @@ export default function App() {
           <Badge tone={tone(dir?.label)}>{dir?.label || "—"} {dir ? `(${dir.score > 0 ? "+" : ""}${fmt(dir.score, 2)})` : ""}</Badge>
           <Badge tone={live ? "up" : "flat"}>{live ? "● live stream" : "○ polling"}</Badge>
           {status?.emergency_shutdown && <Badge tone="down">EMERGENCY STOP</Badge>}
+          {analysis?.tier1?.blackout && <Badge tone="down">NFP/CPI WINDOW</Badge>}
         </div>
         <div className="controls">
           <div className="seg">
@@ -179,11 +183,12 @@ export default function App() {
         </Card>
         <div className="span-4"><SignalPanel evaluation={evaluation} /></div>
         <div className="span-7"><MtfTable analysis={analysis} /></div>
-        <div className="span-5"><IndicatorsPanel analysis={analysis} timeframe="M15" /></div>
+        <div className="span-5"><NfpCpiPanel analysis={analysis} /></div>
         <div className="span-7"><LiquidityPanel analysis={analysis} /></div>
-        <div className="span-5"><RiskPanel risk={risk} onAckPause={ackPause} /></div>
-        <div className="span-6"><CalendarPanel analysis={analysis} /></div>
-        <div className="span-6"><NewsPanel analysis={analysis} /></div>
+        <div className="span-5"><IndicatorsPanel analysis={analysis} timeframe={analysis?.profile?.entry || "M15"} /></div>
+        <div className="span-4"><RiskPanel risk={risk} onAckPause={ackPause} /></div>
+        <div className="span-4"><CalendarPanel analysis={analysis} /></div>
+        <div className="span-4"><NewsPanel analysis={analysis} /></div>
         <div className="span-12"><PerformancePanel performance={performance} backtest={backtest} learning={learning} onRunBacktest={runBacktest} running={running} /></div>
         <div className="span-12"><JournalPanel journal={journal} kind={journalKind} onKind={setJournalKind} /></div>
       </main>

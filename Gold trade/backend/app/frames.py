@@ -250,10 +250,16 @@ def resample_frame(frame: PriceFrame, timeframe: str) -> PriceFrame:
     grouped = grouped.dropna(subset=["open", "high", "low", "close"])
     expected = CHILD_BARS.get(timeframe)
     if expected is not None:
-        minimum = expected if timeframe != "D1" else int(expected * 0.9)
-        if timeframe == "W1":
-            minimum = int(expected * 0.9)
+        # Intraday buckets may miss children around the daily trading break
+        # (about an hour for XAU/USD), so 75% coverage is enough for M15-H4.
+        share = 0.75 if timeframe in {"M15", "H1", "H4"} else 0.9
+        minimum = max(1, int(expected * share)) if timeframe != "M15" else expected
         grouped = grouped[grouped["count"] >= minimum]
+    if timeframe in {"M15", "H1", "H4", "D1"} and len(grouped):
+        # A bucket is only a confirmed bar once its period has ended.
+        last_close = index[-1] + pd.Timedelta(minutes=5)
+        ends = grouped.index + pd.Timedelta(minutes=TIMEFRAME_MINUTES[timeframe])
+        grouped = grouped[ends <= last_close]
     if timeframe == "MN1":
         grouped = grouped[grouped["count"] >= 20 * 288 * 0.9]
     return PriceFrame(

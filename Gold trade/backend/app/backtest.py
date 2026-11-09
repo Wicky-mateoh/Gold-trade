@@ -36,7 +36,16 @@ BAR_DURATION = {
 }
 
 
-def run_backtest(frame, settings, costs: CostModel | None = None, warmup: int = 220, higher: dict | None = None) -> dict:
+def run_backtest(
+    frame,
+    settings,
+    costs: CostModel | None = None,
+    warmup: int = 220,
+    higher: dict | None = None,
+    events: list | None = None,
+    roles: dict | None = None,
+    max_hold_minutes: int | None = None,
+) -> dict:
     """Replay the signal and risk gates bar by bar.
 
     `higher` maps timeframe -> PriceFrame (e.g. {"D1": ..., "H4": ...}). When
@@ -49,6 +58,10 @@ def run_backtest(frame, settings, costs: CostModel | None = None, warmup: int = 
         return _empty("History is shorter than the warmup window.")
     features = _features(frame)
     htf = _higher_features(frame, higher or {})
+    blackout = _blackout_mask(frame, events or [], settings.macro_blackout_before_min, settings.macro_blackout_after_min)
+    roles = roles or {"primary": "D1", "secondary": "H4", "confirm": "H1"}
+    step = BAR_DURATION.get(frame.timeframe, pd.Timedelta(minutes=5))
+    max_hold_bars = None if not max_hold_minutes else max(1, int(pd.Timedelta(minutes=max_hold_minutes) / step))
     account = AccountState(settings.account_equity, settings.account_equity, settings.account_equity)
     trades: list[dict] = []
     open_trade: dict | None = None
@@ -56,13 +69,15 @@ def run_backtest(frame, settings, costs: CostModel | None = None, warmup: int = 
     for i in range(warmup, len(frame) - 1):
         bar_time = pd.Timestamp(frame.time[i]).to_pydatetime()
         if open_trade is not None:
-            closed = _try_exit(open_trade, frame, i, costs, settings.contract_ounces)
+            timed_out = max_hold_bars is not None and i - open_trade["opened_index"] + 1 >= max_hold_bars
+            closed = _try_exit(open_trade, frame, i, costs, settings.contract_ounces, timed_out)
             if closed is not None:
                 register_closed_trade(account, closed["pnl"], settings)
                 trades.append(closed)
                 open_trade = None
         if open_trade is None and not account.loss_pause and not account.emergency_shutdown:
-            context = _context_at(frame, features, i, settings.instrument, htf)
+            context = _context_at(frame, features, i, settings.instrument, htf, roles)
+            context.macro_blackout = bool(blackout[i])
             signal = decide(context, settings.min_signal_confidence, settings.min_reward_risk, settings.max_spread)
             if signal["actionable"]:
                 proposal = OrderProposal(
@@ -250,6 +265,25 @@ def _bias_from(frame, visible_high: list[int], visible_low: list[int]) -> str:
     return "ranging"
 
 
+def _blackout_mask(frame, events: list, before_min: int, after_min: int) -> np.ndarray:
+    """True where the bar closes inside a high-impact event window (same rule as live macro_context)."""
+    mask = np.zeros(len(frame), dtype=bool)
+    step = BAR_DURATION.get(frame.timeframe)
+    if not events or step is None:
+        return mask
+    closes = (pd.DatetimeIndex(frame.time) + step).tz_localize("UTC")
+    for event in events:
+        if event.impact not in {"high", "holiday"}:
+            continue
+        # Per-event windows: NFP/CPI carry the wider tier-1 window.
+        start, end = event.window(before_min, after_min)
+        lo, hi = pd.Timestamp(start), pd.Timestamp(end)
+        lo = lo.tz_localize("UTC") if lo.tzinfo is None else lo.tz_convert("UTC")
+        hi = hi.tz_localize("UTC") if hi.tzinfo is None else hi.tz_convert("UTC")
+        mask |= np.asarray((closes >= lo) & (closes <= hi))
+    return mask
+
+
 def _higher_features(entry, higher: dict) -> dict:
     out = {}
     entry_step = BAR_DURATION.get(entry.timeframe)
@@ -279,16 +313,20 @@ def _higher_bias(htf: dict, timeframe: str, index: int) -> str | None:
     return _bias_from(row["frame"], vh, vl)
 
 
-def _context_at(frame, features: dict, index: int, instrument: str, htf: dict | None = None) -> MarketContext:
+def _context_at(frame, features: dict, index: int, instrument: str, htf: dict | None = None, roles: dict | None = None) -> MarketContext:
+    roles = roles or {"primary": "D1", "secondary": "H4", "confirm": "H1"}
     visible_high, visible_low = _visible_swings(features, index)
     bias = _bias_from(frame, visible_high, visible_low)
-    biases = {"D1": bias, "H4": bias, "H1": bias, "M15": bias}
-    biases[frame.timeframe] = bias
-    for timeframe in ("D1", "H4", "H1"):
+    role_frames = (roles["primary"], roles["secondary"], roles["confirm"])
+    # Frames without their own data fall back to the entry frame's bias.
+    biases = {tf: bias for tf in ("D1", "H4", "H1", "M15", *role_frames)}
+    for timeframe in role_frames:
+        if timeframe == frame.timeframe:
+            continue
         higher_bias = _higher_bias(htf or {}, timeframe, index)
         if higher_bias is not None:
             biases[timeframe] = higher_bias
-    directional = [biases[tf] for tf in ("D1", "H4", "H1") if biases[tf] in {"bullish", "bearish"}]
+    directional = [biases[tf] for tf in role_frames if biases[tf] in {"bullish", "bearish"}]
     conflict = "bullish" in directional and "bearish" in directional
     event = None
     if bias == "bullish" and visible_low and frame.close[index] < frame.low[visible_low[-1]]:
@@ -351,6 +389,9 @@ def _context_at(frame, features: dict, index: int, instrument: str, htf: dict | 
         resistance=[] if high is None else [high],
         session=session_at(frame.time[index]),
         indicator_snapshot={},
+        primary_tf=roles["primary"],
+        secondary_tf=roles["secondary"],
+        confirm_tf=roles["confirm"],
     )
 
 
@@ -397,13 +438,13 @@ def _open_from_next(signal: dict, frame, index: int, decision: dict, costs: Cost
     }
 
 
-def _try_exit(trade: dict, frame, index: int, costs: CostModel, ounces: float) -> dict | None:
+def _try_exit(trade: dict, frame, index: int, costs: CostModel, ounces: float, timed_out: bool = False) -> dict | None:
     stop_hit = frame.low[index] <= trade["stop"] if trade["direction"] == "BUY" else frame.high[index] >= trade["stop"]
     target_hit = frame.high[index] >= trade["target"] if trade["direction"] == "BUY" else frame.low[index] <= trade["target"]
-    if not stop_hit and not target_hit:
+    if not stop_hit and not target_hit and not timed_out:
         return None
-    # Same-bar ambiguity is resolved in favor of the stop.
-    exit_price = trade["stop"] if stop_hit else trade["target"]
+    # Same-bar ambiguity is resolved in favor of the stop. A max-hold exit fills at the bar close.
+    exit_price = trade["stop"] if stop_hit else trade["target"] if target_hit else float(frame.close[index])
     slip = costs.slippage
     if trade["direction"] == "BUY":
         exit_price -= slip
@@ -417,6 +458,7 @@ def _try_exit(trade: dict, frame, index: int, costs: CostModel, ounces: float) -
         "pnl": round(float(pnl), 2),
         "closed_index": index,
         "outcome": "loss" if pnl < 0 else "win",
+        "exit_reason": "stop" if stop_hit else "target" if target_hit else "max hold time",
         "closed_at": pd.Timestamp(frame.time[index]).isoformat(),
     }
 
@@ -494,7 +536,7 @@ def _empty(note: str) -> dict:
     }
 
 
-def validate_out_of_sample(frame, settings, costs: CostModel | None = None, folds: int = 4, warmup: int = 220, higher: dict | None = None) -> dict:
+def validate_out_of_sample(frame, settings, costs: CostModel | None = None, folds: int = 4, warmup: int = 220, **kwargs) -> dict:
     """Walk-forward over sequential, non-overlapping time segments.
 
     The rule set has no fitted parameters, so the first segment is the
@@ -512,7 +554,7 @@ def validate_out_of_sample(frame, settings, costs: CostModel | None = None, fold
         start = max(0, fold * segment - warmup)
         end = n if fold == folds else (fold + 1) * segment
         piece = _segment(frame, start, end)
-        result = run_backtest(piece, settings, costs, warmup=warmup, higher=higher)
+        result = run_backtest(piece, settings, costs, warmup=warmup, **kwargs)
         metrics = result["metrics"]
         role = "development" if fold == 0 else "out_of_sample"
         if role == "out_of_sample":

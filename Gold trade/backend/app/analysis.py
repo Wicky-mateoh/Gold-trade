@@ -1,8 +1,9 @@
 """Multi-timeframe analysis orchestrator.
 
 Collects structure, SMC, indicators, macro, and sentiment for every frame and
-assembles the `MarketContext` that the signal gate scores. Higher frames set
-direction (MN1, W1, D1, H4); lower frames (H1, M15, M5) describe the entry.
+assembles the `MarketContext` that the signal gate scores. The strategy
+profile (profiles.py) decides which of M15/H1/H4/D1 set direction, confirm,
+and time the entry. MN1, W1 and M5 are shown for context only.
 This module does not size or route orders.
 """
 
@@ -17,18 +18,13 @@ from app.frames import PriceFrame
 from app.indicators import atr, indicator_agreement, indicator_snapshot, volatility_regime
 from app.macro import EconomicEvent, macro_context
 from app.market import TIMEFRAMES, MarketDataEngine
+from app.profiles import DISPLAY_ONLY, Profile, get_profile
 from app.sentiment import NewsItem, classify_news
 from app.sessions import session_at
 from app.signals import MarketContext, fibonacci_for_context
 from app.smc import smc_snapshot
 from app.structure import market_structure, timeframe_conflict
 
-HIGHER_TIMEFRAMES = ("MN1", "W1", "D1", "H4")
-LOWER_TIMEFRAMES = ("H1", "M15", "M5")
-ENTRY_TIMEFRAME = "M15"
-# Frames used for the conflict test. MN1 and W1 move too slowly to veto an
-# intraday setup, so they are reported but not counted as a conflict.
-CONFLICT_TIMEFRAMES = ("D1", "H4", "H1")
 # Bars per frame passed to the heavier engines. Older history does not change
 # the latest swing structure and would only slow the API.
 ANALYSIS_WINDOW = {"MN1": 240, "W1": 400, "D1": 600, "H4": 800, "H1": 1000, "M15": 1000, "M5": 1200}
@@ -52,7 +48,20 @@ def _tail(frame: PriceFrame, timeframe: str) -> PriceFrame:
     )
 
 
-def timeframe_report(engine: MarketDataEngine) -> dict[str, dict]:
+def _role(timeframe: str, profile: Profile) -> str:
+    if timeframe in (profile.primary, profile.secondary):
+        return "direction"
+    if timeframe == profile.entry and timeframe == profile.confirm:
+        return "confirm + entry"
+    if timeframe == profile.confirm:
+        return "confirm"
+    if timeframe == profile.entry:
+        return "entry"
+    return "context"
+
+
+def timeframe_report(engine: MarketDataEngine, profile: Profile | None = None) -> dict[str, dict]:
+    profile = profile or get_profile("intraday")
     report: dict[str, dict] = {}
     for timeframe in TIMEFRAMES:
         frame = engine.frame(timeframe)
@@ -77,17 +86,21 @@ def timeframe_report(engine: MarketDataEngine) -> dict[str, dict]:
             "last_swing_low": structure.last_swing_low,
             "indicators": snapshot,
             "indicator_agreement": round(indicator_agreement(snapshot), 3),
-            "role": "direction" if timeframe in HIGHER_TIMEFRAMES else "entry",
+            "role": _role(timeframe, profile),
         }
     return report
 
 
-def overall_direction(report: dict[str, dict]) -> dict:
-    weights = {"MN1": 0.5, "W1": 0.8, "D1": 1.2, "H4": 1.0, "H1": 0.6, "M15": 0.3, "M5": 0.1}
+def overall_direction(report: dict[str, dict], profile: Profile | None = None) -> dict:
+    profile = profile or get_profile("intraday")
+    # Only the profile's frames vote; context frames (MN1, W1, M5) do not.
+    weights = {profile.primary: 1.2, profile.secondary: 1.0, profile.confirm: 0.6, profile.entry: 0.3}
     score = 0.0
     total = 0.0
     for timeframe, row in report.items():
         weight = weights.get(timeframe, 0.0)
+        if weight == 0.0:
+            continue
         bias = row.get("bias")
         if bias == "bullish":
             score += weight
@@ -102,12 +115,13 @@ def overall_direction(report: dict[str, dict]) -> dict:
         label = "bearish"
     else:
         label = "mixed"
-    biases = {tf: report[tf]["bias"] for tf in CONFLICT_TIMEFRAMES if tf in report}
+    biases = {tf: report[tf]["bias"] for tf in profile.conflict_frames if tf in report}
     return {
         "label": label,
         "score": round(normalized, 3),
         "conflict": timeframe_conflict(biases),
-        "conflict_frames": list(CONFLICT_TIMEFRAMES),
+        "conflict_frames": list(profile.conflict_frames),
+        "voting_frames": list(weights),
     }
 
 
@@ -151,27 +165,34 @@ def sentiment_summary(items: list[NewsItem], now: datetime, lookback_hours: int 
 
 def build_context(
     engine: MarketDataEngine,
-    events: list[EconomicEvent],
+    events,
     news: list[NewsItem],
     settings,
     now: datetime | None = None,
 ) -> tuple[MarketContext, dict]:
-    """Return the signal context plus a full dashboard payload."""
-    report = timeframe_report(engine)
-    direction = overall_direction(report)
-    entry = engine.frame(ENTRY_TIMEFRAME)
+    """Return the signal context plus a full dashboard payload.
+
+    `events` is a list of EconomicEvent or an EventCalendar (which then
+    supplies events, including the NFP/CPI schedule, around the analysis clock).
+    """
+    profile = get_profile(getattr(settings, "strategy_profile", "intraday"))
+    report = timeframe_report(engine, profile)
+    direction = overall_direction(report, profile)
+    entry_tf = profile.entry
+    entry = engine.frame(entry_tf)
     base = engine.frame("M5")
     problems: list[str] = []
     if entry is None or len(entry) < 60:
-        problems.append(f"{ENTRY_TIMEFRAME} history is too short for an entry read.")
-    for timeframe in ("D1", "H4", "H1"):
+        problems.append(f"{entry_tf} history is too short for an entry read.")
+    for timeframe in profile.conflict_frames:
         if not report.get(timeframe, {}).get("available"):
             problems.append(f"{timeframe} frame is unavailable.")
     sync = engine.synchronization_report()
     if not sync["aligned"]:
         problems.append(f"Timeframes are not synchronized: {sync['detail']}.")
 
-    last_bar = None if base is None or len(base) == 0 else pd.Timestamp(base.time[-1]).tz_localize("UTC")
+    # The clock is the close of the last confirmed M5 bar (its label is the open).
+    last_bar = None if base is None or len(base) == 0 else pd.Timestamp(base.time[-1]).tz_localize("UTC") + pd.Timedelta(minutes=5)
     if now is None:
         # Analysis time is the last confirmed bar, so history replays stay causal.
         moment = last_bar.to_pydatetime() if last_bar is not None else datetime.now(timezone.utc)
@@ -180,16 +201,19 @@ def build_context(
         if last_bar is not None and engine.source != "synthetic" and moment - last_bar.to_pydatetime() > STALE_AFTER:
             problems.append("The latest candle is stale relative to the analysis clock.")
 
-    entry_window = _tail(entry, ENTRY_TIMEFRAME) if entry is not None else None
+    calendar = events if hasattr(events, "around") else None
+    event_list: list[EconomicEvent] = calendar.around(moment) if calendar is not None else list(events or [])
+
+    entry_window = _tail(entry, entry_tf) if entry is not None else None
     smc = smc_snapshot(entry_window) if entry_window is not None else smc_snapshot(None)
-    entry_report = report.get(ENTRY_TIMEFRAME, {})
+    entry_report = report.get(entry_tf, {})
     snapshot = entry_report.get("indicators", {}) if entry_report.get("available") else {}
     atr_series = atr(entry_window.high, entry_window.low, entry_window.close) if entry_window is not None else np.array([])
     volatility = volatility_regime(atr_series) if len(atr_series) else "unknown"
 
     macro = macro_context(
         moment,
-        events,
+        event_list,
         settings.macro_blackout_before_min,
         settings.macro_blackout_after_min,
         settings.dxy_session_change,
@@ -218,7 +242,7 @@ def build_context(
             f"(confidence {sentiment['confidence']:.2f}, {sentiment['usable_count']} usable items)."
         )
 
-    d1 = report.get("D1", {})
+    d1 = report.get(profile.primary, {})
     context = MarketContext(
         instrument=settings.instrument,
         timestamp=moment,
@@ -247,6 +271,9 @@ def build_context(
         data_problems=problems,
         indicator_snapshot=snapshot,
         fundamental_notes=fundamental_notes,
+        primary_tf=profile.primary,
+        secondary_tf=profile.secondary,
+        confirm_tf=profile.confirm,
     )
     payload = {
         "timestamp": moment.astimezone(timezone.utc).isoformat(),
@@ -258,6 +285,17 @@ def build_context(
         "smc": smc,
         "volatility": volatility,
         "macro": macro,
+        "tier1": calendar.tier1_status(moment, event_list) if calendar is not None else None,
+        "profile": {
+            "name": profile.name,
+            "primary": profile.primary,
+            "secondary": profile.secondary,
+            "confirm": profile.confirm,
+            "entry": profile.entry,
+            "max_hold_minutes": profile.max_hold_minutes,
+            "description": profile.description,
+            "context_only": list(DISPLAY_ONLY),
+        },
         "sentiment": sentiment,
         "fibonacci": context.fib_levels,
         "data": {

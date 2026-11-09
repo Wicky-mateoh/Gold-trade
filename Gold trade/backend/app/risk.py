@@ -36,6 +36,8 @@ class OrderProposal:
     timestamp: datetime
     recovery_multiplier: float = 1.0
     requested_risk_pct: float | None = None
+    # Set by the caller from the calendar; the risk gate refuses new risk on its own.
+    event_blackout: bool = False
 
 
 def roll_account_clock(account: AccountState, moment: datetime) -> None:
@@ -54,6 +56,8 @@ def assess(proposal: OrderProposal, account: AccountState, settings) -> dict:
     reasons: list[str] = []
     if account.emergency_shutdown:
         reasons.append("Emergency shutdown is active.")
+    if proposal.event_blackout:
+        reasons.append("A high-impact release window (e.g. NFP or CPI) is active. No new risk.")
     if proposal.recovery_multiplier != 1:
         reasons.append("Recovery multipliers are rejected. Size is not increased after a loss.")
     if account.loss_pause or account.consecutive_losses >= settings.max_consecutive_losses:
@@ -72,6 +76,11 @@ def assess(proposal: OrderProposal, account: AccountState, settings) -> dict:
     stop_distance = abs(proposal.entry - proposal.stop_loss)
     if stop_distance <= 0:
         reasons.append("Stop distance must be positive.")
+    ratio_limit = getattr(settings, "max_spread_stop_ratio", None)
+    if ratio_limit and stop_distance > 0 and proposal.spread / stop_distance > ratio_limit:
+        reasons.append(
+            f"Spread is {proposal.spread / stop_distance:.0%} of the stop distance; the limit is {ratio_limit:.0%}."
+        )
     if proposal.direction == "BUY" and proposal.stop_loss >= proposal.entry:
         reasons.append("A long stop must sit below entry.")
     if proposal.direction == "SELL" and proposal.stop_loss <= proposal.entry:
@@ -153,3 +162,22 @@ def _drawdown_pct(start_equity: float, equity: float) -> float:
     if start_equity <= 0:
         return 0.0
     return max(0.0, (start_equity - equity) / start_equity * 100.0)
+
+
+def check_fill(direction: str, entry_low: float, entry_high: float, fill: float, max_slippage: float) -> dict:
+    """Slippage protection: a fill outside the entry zone by more than max_slippage is refused.
+
+    For a long, paying above the zone is adverse; for a short, selling below it is.
+    """
+    if direction == "BUY":
+        adverse = max(0.0, fill - entry_high)
+    else:
+        adverse = max(0.0, entry_low - fill)
+    accepted = adverse <= max_slippage + 1e-9
+    return {
+        "accepted": accepted,
+        "adverse_slippage": round(adverse, 3),
+        "reason": "Fill is within the slippage limit."
+        if accepted
+        else f"Fill {fill:.2f} is {adverse:.2f} beyond the entry zone; limit is {max_slippage:.2f}.",
+    }

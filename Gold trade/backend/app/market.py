@@ -136,7 +136,8 @@ class MT5Feed:
         if not authorized:
             mt5.shutdown()
             raise RuntimeError(f"MT5 login failed: {mt5.last_error()}")
-        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, count)
+        # Position 1 skips the bar that is still forming; analysis uses closed bars only.
+        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 1, count)
         mt5.shutdown()
         if rates is None or len(rates) == 0:
             raise RuntimeError("MT5 returned no M5 rates.")

@@ -117,7 +117,7 @@ export function IndicatorsPanel({ analysis, timeframe }) {
       </div>
       {analysis?.fibonacci && Object.keys(analysis.fibonacci).length > 0 && (
         <>
-          <h3>Fibonacci (D1 dealing range)</h3>
+          <h3>Fibonacci ({analysis?.profile?.primary || "D1"} dealing range)</h3>
           <div className="chips">
             {Object.entries(analysis.fibonacci).map(([k, v]) => <span className="chip" key={k}>{k}: {fmt(v)}</span>)}
           </div>
@@ -177,13 +177,78 @@ export function CalendarPanel({ analysis }) {
         {[...(macro.active_events || []).map((e) => ({ ...e, active: true })), ...(macro.upcoming || [])].map((e, i) => (
           <li key={i} className={e.active ? "active" : ""}>
             <span className="mono">{time(e.timestamp)}</span>
-            <span>{e.name}</span>
+            <span>{e.name}{e.tier1 && <span className="tag">{e.kind.toUpperCase()}</span>}{e.confirmed === false && <span className="tag dim">estimated</span>}</span>
             <Badge tone={e.impact === "high" ? "down" : "flat"}>{e.impact}</Badge>
           </li>
         ))}
         {!macro.upcoming?.length && !macro.active_events?.length && <li className="muted">No events loaded.</li>}
       </ul>
       {(macro.notes || []).map((n, i) => <p className="fine" key={i}>{n}</p>)}
+    </Card>
+  );
+}
+
+const nyTime = (iso) =>
+  iso
+    ? new Date(iso).toLocaleString("en-US", { timeZone: "America/New_York", weekday: "short", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) + " NY"
+    : "—";
+
+const countdown = (minutes) => {
+  if (minutes === null || minutes === undefined) return "—";
+  if (minutes < 0) return "released";
+  const d = Math.floor(minutes / 1440);
+  const h = Math.floor((minutes % 1440) / 60);
+  const m = minutes % 60;
+  return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`;
+};
+
+export function NfpCpiPanel({ analysis }) {
+  const t = analysis?.tier1;
+  if (!t) return <Card title="NFP & CPI monitor"><p className="muted">Loading…</p></Card>;
+  const p = t.policy || {};
+  const state = t.flatten_due ? ["CLOSING POSITIONS", "down"] : t.blackout ? ["NO NEW TRADES", "down"] : ["clear", "up"];
+  return (
+    <Card
+      title="NFP & CPI monitor"
+      subtitle={`No new trades ${p.blackout_before_min}m before → ${p.blackout_after_min}m after · open trades close ${p.flatten_before_min}m before release`}
+      actions={<Badge tone={state[1]}>{state[0]}</Badge>}
+    >
+      <div className="tier1">
+        {["nfp", "cpi"].map((k) => {
+          const r = t[k];
+          if (!r) return null;
+          const n = r.next;
+          return (
+            <div className={`tier1-row ${r.in_blackout ? "hot" : ""}`} key={k}>
+              <div className="tier1-head">
+                <strong>{k.toUpperCase()}</strong>
+                <span className="muted">{r.label}</span>
+                {n && <Badge tone={r.confirmed ? "up" : "flat"}>{r.confirmed ? "confirmed" : "estimated"}</Badge>}
+                {r.in_blackout && <Badge tone="down">window active</Badge>}
+              </div>
+              <div className="tier1-body">
+                <div className="countdown">{countdown(r.minutes_until)}</div>
+                <div>
+                  <div className="mono">{nyTime(n?.timestamp)}</div>
+                  <div className="muted mono">{n ? n.timestamp.slice(0, 16).replace("T", " ") + "Z" : ""} · {n?.source?.replaceAll("_", " ")}</div>
+                </div>
+              </div>
+              {r.candidate_dates?.length > 1 && (
+                <div className="fine">
+                  Date not confirmed yet — all candidate days are protected: {r.candidate_dates.map((d) => new Date(d).toLocaleDateString("en-US", { timeZone: "America/New_York", month: "short", day: "numeric" })).join(", ")}
+                </div>
+              )}
+              {n && (n.forecast || n.previous) && (
+                <div className="fine">Forecast {n.forecast ?? "—"} · previous {n.previous ?? "—"}</div>
+              )}
+              {r.last_release && (
+                <div className="fine">Last: {r.last_release.name} · actual {r.last_release.actual ?? "—"} vs forecast {r.last_release.forecast ?? "—"}</div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+      <p className="fine">Feed: {t.feed_status}. {p.rule}</p>
     </Card>
   );
 }

@@ -51,8 +51,22 @@ Sources are tried in this order:
 3. **Synthetic**, used when neither is available. The dashboard shows a banner, and the
    example calendar and news rows are loaded.
 
-Data loads once at startup. Restart the service, or add a scheduler that calls
-`MarketDataEngine.load_base`, to pull new bars.
+The background cycle (`AUTO_CYCLE_SECONDS`, default 60) reloads the CSV or pulls MT5 rates,
+checks open simulated positions against every new bar, and evaluates once per new closed
+bar. A failed pull keeps the last good data and is journaled.
+
+## NFP & CPI calendar
+
+The built-in schedule protects NFP and CPI with no setup. For confirmed dates plus
+forecast/previous/actual values, either:
+
+* set `CALENDAR_FEED_URL` to a JSON feed of ForexFactory-style rows (`title, country, date,
+  impact, forecast, previous[, actual]`). It's fetched every `CALENDAR_REFRESH_MINUTES`
+  and cached in `var/calendar_cache.json`; or
+* fill `data/economic_calendar.csv` from bls.gov / federalreserve.gov schedules.
+
+Check the source's terms of use before automated fetching. The dashboard's NFP & CPI panel
+shows whether each next release is *confirmed* or *estimated*.
 
 ## Contract settings
 

@@ -19,8 +19,9 @@ import numpy as np
 import pandas as pd
 
 from app.analysis import build_context
+from app.econ_calendar import EventCalendar
 from app.backtest import CostModel, run_backtest, validate_out_of_sample
-from app.execution import ExecutionBook, LiveChecklist
+from app.execution import CLOSE_EVENTS, ExecutionBook, LiveChecklist
 from app.journal import Cache, Journal, to_jsonable
 from app.learning import (
     ModelRegistry,
@@ -32,6 +33,7 @@ from app.learning import (
 )
 from app.macro import EconomicEvent, load_calendar
 from app.market import MarketDataEngine, build_engine
+from app.profiles import get_profile
 from app.risk import AccountState, OrderProposal, assess, propose_stop_update, register_closed_trade, roll_account_clock
 from app.sentiment import NewsItem, load_news_directory
 from app.signals import decide
@@ -52,6 +54,9 @@ class TradingService:
             self.events = load_calendar(root / "data" / "economic_calendar.example.csv")
             self.news = load_news_directory(root / "data" / "news", include_examples=True)
             self.content_note = "Synthetic demo: calendar and news are EXAMPLE rows, not real events."
+        self.calendar = EventCalendar(settings, self.events, self.state_dir / "calendar_cache.json")
+        self.calendar.refresh()
+        self.profile = get_profile(settings.strategy_profile)
         self.account = AccountState(settings.account_equity, settings.account_equity, settings.account_equity)
         self.account.emergency_shutdown = False
         self.book = ExecutionBook()
@@ -61,6 +66,7 @@ class TradingService:
         self.equity_history: list[dict] = [{"time": datetime.now(timezone.utc).isoformat(), "equity": self.account.equity}]
         self.last_backtest: dict | None = None
         self.last_validation: dict | None = None
+        self._last_recorded_bar: str | None = None
         if settings.app_mode == "paper":
             self.book.set_mode("paper")
         elif settings.app_mode == "live":
@@ -94,20 +100,34 @@ class TradingService:
             "loss_pause": self.account.loss_pause,
             "risk_limits": self.settings.risk_snapshot(),
             "events_loaded": len(self.events),
+            "calendar_feed": self.calendar.feed_status,
+            "strategy_profile": self.profile.name,
             "news_loaded": len(self.news),
         }
 
     # ---------------------------------------------------------------- analysis
     def analysis(self, now: datetime | None = None) -> dict:
         with self.lock:
-            _, payload = build_context(self.engine, self.events, self.news, self.settings, now)
+            _, payload = build_context(self.engine, self.calendar, self.news, self.settings, now)
             self.cache.set_json("analysis", payload, ttl=30)
             return to_jsonable(payload)
 
     def evaluate(self, now: datetime | None = None, record: bool = True) -> dict:
-        """Run the full decision pipeline once and journal every outcome."""
+        """Run the full decision pipeline once and journal the outcome.
+
+        A decision is journaled once per closed bar: re-polling the same bar
+        returns the same answer without duplicating journal rows or opening a
+        second position. record=False is a preview (used by the live stream).
+        """
         with self.lock:
-            context, payload = build_context(self.engine, self.events, self.news, self.settings, now)
+            closed = self.mark_paper() if record and self.book.mode == "paper" else []
+            context, payload = build_context(self.engine, self.calendar, self.news, self.settings, now)
+            tier1 = payload.get("tier1") or {}
+            if record and tier1.get("flatten_due") and self.book.paper_positions:
+                closed += self._event_flatten(tier1)
+            bar_key = context.timestamp.astimezone(timezone.utc).isoformat()
+            repeat = record and bar_key == self._last_recorded_bar
+            persist = record and not repeat
             signal = decide(
                 context,
                 self.settings.min_signal_confidence,
@@ -120,6 +140,8 @@ class TradingService:
             signal["atr"] = context.atr
             risk = None
             position = None
+            # The risk gate counts the book's real open positions.
+            self.account.open_positions = [dict(row) for row in self.book.paper_positions]
             if signal["actionable"]:
                 proposal = OrderProposal(
                     direction=signal["direction"],
@@ -128,47 +150,125 @@ class TradingService:
                     take_profit=float(signal["take_profits"][0]),
                     spread=float(context.spread or 0.0),
                     timestamp=context.timestamp,
+                    event_blackout=bool(context.macro_blackout or tier1.get("blackout") or tier1.get("flatten_due")),
                 )
                 risk = assess(proposal, self.account, self.settings)
-                if record:
+                if persist:
                     self.journal.record("signal", signal)
                     self.journal.record("risk_decision", {"signal_timestamp": signal["timestamp"], **risk})
-                # Preview evaluations (record=False, used by the live stream) never open positions.
-                if risk["approved"] and self.book.mode == "paper" and record:
-                    position = self.book.open_paper(signal, risk, context.timestamp)
-                    if position and record:
-                        self.journal.record("execution", {**position, "event": "open", "confidence": signal["confidence"], "regime": signal["regime"]})
-            elif record:
+                if persist and risk["approved"] and self.book.mode == "paper":
+                    fills_before = len(self.book.fills)
+                    position = self.book.open_paper(signal, risk, context.timestamp, self.settings.max_slippage)
+                    if position:
+                        # Entry is at this bar's close, so marking starts with the next bar.
+                        position["marked_until"] = bar_key
+                        self.account.open_positions = [dict(row) for row in self.book.paper_positions]
+                        self.journal.record(
+                            "execution",
+                            {**position, "event": "open", "confidence": signal["confidence"], "regime": signal["regime"]},
+                        )
+                    else:
+                        for row in self.book.fills[fills_before:]:
+                            self.journal.record("execution", row, note="Paper fill refused.")
+            elif persist:
                 self.journal.record("rejected_setup", signal)
+            if persist:
+                self._last_recorded_bar = bar_key
             result = {
                 "signal": signal,
                 "risk": risk,
                 "paper_position": position,
+                "paper_closed": closed,
                 "mode": self.book.mode,
                 "orders_sent_to_broker": 0,
                 "analysis_timestamp": payload["timestamp"],
+                "repeat_of_journaled_bar": repeat,
+                "tier1": tier1,
             }
             return to_jsonable(result)
 
     def mark_paper(self) -> list[dict]:
-        """Mark open paper positions against the latest M5 bar."""
+        """Mark each open paper position against every M5 bar it has not seen yet."""
         with self.lock:
             base = self.engine.frame("M5")
-            if base is None or len(base) == 0:
+            if base is None or len(base) == 0 or not self.book.paper_positions:
                 return []
-            closed = self.book.mark_paper(
-                float(base.high[-1]),
-                float(base.low[-1]),
-                float(base.close[-1]),
-                self.settings.max_slippage / 2,
-                self.settings.contract_ounces,
-            )
+            # Compare bar CLOSE times: entry and marked_until are recorded at a bar's close.
+            closes = pd.DatetimeIndex(base.time).tz_localize("UTC") + pd.Timedelta(minutes=5)
+            closed = []
+            max_hold = pd.Timedelta(minutes=self.profile.max_hold_minutes)
+            for position in list(self.book.paper_positions):
+                since = pd.Timestamp(position.get("marked_until") or position["opened_at"])
+                opened = pd.Timestamp(position["opened_at"])
+                for i in np.flatnonzero(closes > since):
+                    bar_close = closes[i]
+                    row = self.book.mark_position(
+                        position,
+                        float(base.high[i]),
+                        float(base.low[i]),
+                        float(base.close[i]),
+                        self.settings.max_slippage / 2,
+                        self.settings.contract_ounces,
+                        time_exit=bar_close - opened >= max_hold,
+                    )
+                    position["marked_until"] = bar_close.isoformat()
+                    if row is not None:
+                        row["closed_at"] = bar_close.isoformat()
+                        closed.append(row)
+                        break
             for row in closed:
                 register_closed_trade(self.account, row["pnl"], self.settings)
                 self.journal.record("execution", row)
+            self.account.open_positions = [dict(row) for row in self.book.paper_positions]
             if closed:
                 self.equity_history.append({"time": datetime.now(timezone.utc).isoformat(), "equity": self.account.equity})
             return to_jsonable(closed)
+
+    def refresh_data(self) -> dict:
+        """Reload the configured source (CSV or MT5). Synthetic data is static."""
+        if self.engine.source == "synthetic":
+            return {"refreshed": False, "new_bars": 0, "reason": "Synthetic data does not update."}
+        base = self.engine.frame("M5")
+        before = None if base is None or len(base) == 0 else base.time[-1]
+        s = self.settings
+        try:
+            fresh = build_engine(self.root, s.mt5_symbol, s.mt5_login, s.mt5_password, s.mt5_server)
+        except Exception as exc:  # a failed pull keeps the last good data
+            self.journal.record("operator_note", {"refresh_error": str(exc)}, note="Market data refresh failed.")
+            return {"refreshed": False, "new_bars": 0, "reason": str(exc)}
+        new_base = fresh.frame("M5")
+        new_bars = 0 if before is None else int(np.sum(new_base.time > before))
+        with self.lock:
+            self.engine = fresh
+        return {"refreshed": True, "new_bars": new_bars, "last_bar": pd.Timestamp(new_base.time[-1]).isoformat()}
+
+    def _event_flatten(self, tier1: dict) -> list[dict]:
+        """Close simulated positions shortly before NFP/CPI: gold can gap through stops on the release."""
+        base = self.engine.frame("M5")
+        if base is None or len(base) == 0:
+            return []
+        closed = self.book.flatten_paper(
+            float(base.close[-1]), self.settings.max_slippage, self.settings.contract_ounces, event="event_flatten"
+        )
+        names = [tier1[k]["next"]["name"] for k in ("nfp", "cpi") if tier1.get(k, {}).get("flatten_due") and tier1[k].get("next")]
+        for row in closed:
+            row["exit_reason"] = f"pre-release flatten: {', '.join(names)}"
+            register_closed_trade(self.account, row["pnl"], self.settings)
+            self.journal.record("execution", row, note="Closed before a tier-1 release.")
+        self.account.open_positions = [dict(r) for r in self.book.paper_positions]
+        if closed:
+            self.equity_history.append({"time": datetime.now(timezone.utc).isoformat(), "equity": self.account.equity})
+        return closed
+
+    def cycle(self) -> dict:
+        """One autonomous step: refresh calendar and data, then mark and evaluate if a new bar closed."""
+        self.calendar.refresh()
+        refresh = self.refresh_data()
+        result = {"refresh": refresh, "evaluated": False}
+        if refresh["new_bars"] or self._last_recorded_bar is None:
+            evaluation = self.evaluate()
+            result.update({"evaluated": True, "decision": evaluation["signal"]["decision"]})
+        return result
 
     def tighten_stop(self, position_id: str, new_stop: float) -> dict:
         with self.lock:
@@ -207,6 +307,7 @@ class TradingService:
                 for row in closed:
                     register_closed_trade(self.account, row["pnl"], self.settings)
                     self.journal.record("execution", row)
+            self.account.open_positions = []
             self.book.live_enabled = False
             if self.book.mode == "live":
                 self.book.mode = "analysis"
@@ -263,21 +364,27 @@ class TradingService:
             )
 
     # -------------------------------------------------------------- research
-    def backtest(self, timeframe: str = "H1", commission_per_lot: float = 3.5, slippage: float = 0.05) -> dict:
+    def backtest(self, timeframe: str | None = None, commission_per_lot: float = 3.5, slippage: float = 0.05) -> dict:
+        timeframe = timeframe or self.profile.entry
         frame = self.engine.frame(timeframe)
         if frame is None:
             return {"error": f"{timeframe} frame is unavailable."}
         costs = CostModel(commission_per_lot=commission_per_lot, slippage=slippage)
-        order = ["M15", "H1", "H4", "D1"]
-        higher = {tf: self.engine.frame(tf) for tf in order[order.index(timeframe) + 1 :] if tf != timeframe}
+        roles = {"primary": self.profile.primary, "secondary": self.profile.secondary, "confirm": self.profile.confirm}
+        higher = {tf: self.engine.frame(tf) for tf in set(roles.values()) if tf != timeframe}
         higher = {tf: f for tf, f in higher.items() if f is not None}
-        result = run_backtest(frame, self.settings, costs, higher=higher)
-        validation = validate_out_of_sample(frame, self.settings, costs, higher=higher)
+        # Same calendar as live, including the built-in NFP/CPI schedule for every month in the history.
+        events = self.calendar.events_between(pd.Timestamp(frame.time[0]).to_pydatetime(), pd.Timestamp(frame.time[-1]).to_pydatetime())
+        kwargs = dict(higher=higher, events=events, roles=roles, max_hold_minutes=self.profile.max_hold_minutes)
+        result = run_backtest(frame, self.settings, costs, **kwargs)
+        validation = validate_out_of_sample(frame, self.settings, costs, **kwargs)
         payload = {
             "timeframe": timeframe,
             "data_source": self.engine.source,
             "bars": len(frame),
             "higher_timeframes": sorted(higher),
+            "profile": self.profile.name,
+            "calendar_events_applied": len(events),
             "costs": {"commission_per_lot": commission_per_lot, "slippage": slippage, "spread": "per-bar spread column"},
             **result,
             "trades": result["trades"][-200:],
@@ -365,7 +472,7 @@ class TradingService:
         return classify_news(item)
 
     def performance(self) -> dict:
-        closes = [r["payload"] for r in self.journal.rows if r["kind"] == "execution" and r["payload"].get("event") in {"close", "emergency_flatten"}]
+        closes = [r["payload"] for r in self.journal.rows if r["kind"] == "execution" and r["payload"].get("event") in CLOSE_EVENTS]
         daily: dict[str, float] = {}
         weekly: dict[str, float] = {}
         for row in closes:

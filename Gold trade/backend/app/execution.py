@@ -11,6 +11,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 
+# Execution events that realize P&L.
+CLOSE_EVENTS = frozenset({"close", "emergency_flatten", "event_flatten"})
+
+
 @dataclass
 class LiveChecklist:
     explicit_authorization: bool = False
@@ -81,13 +85,20 @@ class ExecutionBook:
             "message": "Live mode is armed for the supplied adapter. This process still requires that adapter's own submit path.",
         }
 
-    def open_paper(self, signal: dict, risk: dict, moment: datetime) -> dict | None:
+    def open_paper(self, signal: dict, risk: dict, moment: datetime, max_slippage: float | None = None) -> dict | None:
         if self.mode != "paper" or not signal.get("actionable") or not risk.get("approved"):
             return None
         if signal["price"] is None or signal["stop_loss"] is None:
             return None
         half_spread = 0.0 if signal.get("spread") is None else float(signal["spread"]) / 2
         entry = signal["price"] + half_spread if signal["direction"] == "BUY" else signal["price"] - half_spread
+        if max_slippage is not None and signal.get("entry_low") is not None:
+            from app.risk import check_fill
+
+            check = check_fill(signal["direction"], signal["entry_low"], signal["entry_high"], entry, max_slippage)
+            if not check["accepted"]:
+                self.fills.append({"event": "rejected_fill", "direction": signal["direction"], "fill": entry, **check})
+                return None
         position = {
             "id": f"paper-{len(self.fills) + len(self.paper_positions) + 1}",
             "direction": signal["direction"],
@@ -103,30 +114,45 @@ class ExecutionBook:
         self.fills.append({**position, "event": "open"})
         return position
 
+    def mark_position(
+        self, position: dict, high: float, low: float, close: float, slippage: float, ounces: float, time_exit: bool = False
+    ) -> dict | None:
+        """Check one bar against one position. Same-bar stop and target: the stop is assumed first.
+
+        time_exit closes at this bar's close when the profile's maximum hold is reached.
+        """
+        stop_hit = low <= position["stop_loss"] if position["direction"] == "BUY" else high >= position["stop_loss"]
+        target_hit = high >= position["take_profit"] if position["direction"] == "BUY" else low <= position["take_profit"]
+        if not stop_hit and not target_hit and not time_exit:
+            position["mark"] = close
+            return None
+        exit_price = position["stop_loss"] if stop_hit else position["take_profit"] if target_hit else close
+        if position["direction"] == "BUY":
+            exit_price -= slippage
+            pnl = (exit_price - position["entry"]) * ounces * position["lots"]
+        else:
+            exit_price += slippage
+            pnl = (position["entry"] - exit_price) * ounces * position["lots"]
+        result = {
+            **position,
+            "event": "close",
+            "exit": round(exit_price, 3),
+            "pnl": round(pnl, 2),
+            "exit_reason": "stop" if stop_hit else "target" if target_hit else "max hold time",
+        }
+        self.paper_positions = [row for row in self.paper_positions if row["id"] != position["id"]]
+        self.fills.append(result)
+        return result
+
     def mark_paper(self, high: float, low: float, close: float, slippage: float, ounces: float) -> list[dict]:
         closed = []
-        still_open = []
-        for position in self.paper_positions:
-            stop_hit = low <= position["stop_loss"] if position["direction"] == "BUY" else high >= position["stop_loss"]
-            target_hit = high >= position["take_profit"] if position["direction"] == "BUY" else low <= position["take_profit"]
-            if not stop_hit and not target_hit:
-                position["mark"] = close
-                still_open.append(position)
-                continue
-            exit_price = position["stop_loss"] if stop_hit else position["take_profit"]
-            if position["direction"] == "BUY":
-                exit_price -= slippage
-                pnl = (exit_price - position["entry"]) * ounces * position["lots"]
-            else:
-                exit_price += slippage
-                pnl = (position["entry"] - exit_price) * ounces * position["lots"]
-            result = {**position, "event": "close", "exit": round(exit_price, 3), "pnl": round(pnl, 2)}
-            self.fills.append(result)
-            closed.append(result)
-        self.paper_positions = still_open
+        for position in list(self.paper_positions):
+            result = self.mark_position(position, high, low, close, slippage, ounces)
+            if result is not None:
+                closed.append(result)
         return closed
 
-    def flatten_paper(self, price: float, slippage: float, ounces: float) -> list[dict]:
+    def flatten_paper(self, price: float, slippage: float, ounces: float, event: str = "emergency_flatten") -> list[dict]:
         closed = []
         for position in self.paper_positions:
             exit_price = price - slippage if position["direction"] == "BUY" else price + slippage
@@ -134,7 +160,7 @@ class ExecutionBook:
                 pnl = (exit_price - position["entry"]) * ounces * position["lots"]
             else:
                 pnl = (position["entry"] - exit_price) * ounces * position["lots"]
-            result = {**position, "event": "emergency_flatten", "exit": round(exit_price, 3), "pnl": round(pnl, 2)}
+            result = {**position, "event": event, "exit": round(exit_price, 3), "pnl": round(pnl, 2)}
             self.fills.append(result)
             closed.append(result)
         self.paper_positions = []

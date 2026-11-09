@@ -13,7 +13,8 @@ def client(service):
 def test_status_and_analysis(service):
     with client(service) as c:
         s = c.get("/api/status").json()
-        assert s["mode"] == "analysis" and s["live_enabled"] is False
+        assert s["mode"] == "paper" and s["live_enabled"] is False
+        assert s["strategy_profile"] == "intraday"
         a = c.get("/api/analysis").json()
         assert set(a["timeframes"]) == {"MN1", "W1", "D1", "H4", "H1", "M15", "M5"}
         assert a["direction"]["label"] in {"bullish", "bearish", "mixed"}

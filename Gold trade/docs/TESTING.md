@@ -5,7 +5,7 @@ cd "Gold trade" && python -m pytest
 ```
 
 The suite generates all its data in-process, so it needs no network, broker or database.
-It has 75 tests and runs in about 5 seconds.
+It has 108 tests and runs in about 7 seconds.
 
 | File | Covers |
 |---|---|
@@ -16,6 +16,9 @@ It has 75 tests and runs in about 5 seconds.
 | `test_signals.py` | Full BUY/SELL payload with all required fields. Every NO TRADE condition (parametrized). Conflict and opposing sentiment lower confidence. SMC alone isn't a signal. |
 | `test_risk_execution.py` | Size capped and rounded down. Spread, R:R, stop side, session and over-risk rejections. Recovery multiplier rejected. Daily and weekly limits. Loss-streak pause with size never growing. Max open positions. Stops can't widen. Learning can't edit risk keys. Live locked without every checklist item and a ready adapter. Paper fills. |
 | `test_backtest_learning.py` | Trades follow the trend, regime labels are real. **No look-ahead**: truncating the history leaves earlier trades unchanged. A random walk doesn't pass the gate. Costs reduce P&L. Metric math. Monte Carlo ordering. Walk-forward segment roles. Calibration/drift/regime. The classifier stays in draft. Model promotion requires validation and persists. |
+| `test_nfp_cpi.py` | NFP first-Friday rule (with DST and the early-Friday case), CPI candidate days, feed parsing, confirmed dates replacing estimates, cache kept when the feed fails, tier-1 window edges (−60/+60), ordinary events keep the −30/+15 window, countdown and flatten flags. |
+| `test_live_path.py` | The live service path end to end. One open position max. Same bar journaled once. The entry bar isn't used to mark the position. Every new bar is marked. Equity matches the journal. Flatten before NFP. No trade inside the window (signal gate and risk gate separately). Max-hold exit. Slippage protection. TP2 beyond TP1 and R:R surviving rounding. Profile roles. Unfinished higher-TF bars dropped. The daily break doesn't delete H4 bars. The backtest skips NFP/CPI windows. CSV refresh detects new bars. |
+| `test_config.py` | `.env.example` loads as shipped and lists every setting. |
 | `test_api.py` | Status, analysis, signals journaled, candles, live can't be enabled through the API, emergency stop/reset cycle, backtest records a model version, recommendations stripped of risk keys, news ingest, journal persistence. |
 
 ## Strategy validation workflow
@@ -35,6 +38,17 @@ It has 75 tests and runs in about 5 seconds.
    backtest's out-of-sample expectancy.
 6. Only then is a **live review** reasonable (see DEPLOYMENT.md). Passing these gates is
    evidence, not a guarantee.
+
+## End-to-end replay (live code path)
+
+```bash
+cd "Gold trade" && python scripts/replay.py --csv data/XAUUSD_M5.csv --start-days 120 --step-bars 12
+```
+
+This feeds history into the running service one step at a time, as a broker would, and
+reports decisions, risk rejections, paper trades, exit reasons, NFP/CPI-blocked steps, and
+whether equity matches the journal. `--demo trend` and `--demo random` use generated data;
+`--profile scalping` switches strategy. Expect about 0.25 s per step.
 
 ## Frontend
 

@@ -43,6 +43,13 @@ class MarketContext:
     data_problems: list[str] = field(default_factory=list)
     indicator_snapshot: dict = field(default_factory=dict)
     fundamental_notes: list[str] = field(default_factory=list)
+    # Timeframe roles from the strategy profile (defaults = intraday).
+    primary_tf: str = "D1"
+    secondary_tf: str = "H4"
+    confirm_tf: str = "H1"
+
+    def tf_name(self, timeframe: str) -> str:
+        return {"D1": "Daily", "H4": "H4", "H1": "H1", "M15": "M15"}.get(timeframe, timeframe)
 
 
 def decide(context: MarketContext, min_confidence: float, min_reward_risk: float, max_spread: float) -> dict:
@@ -64,8 +71,8 @@ def decide(context: MarketContext, min_confidence: float, min_reward_risk: float
         reasons.append(f"Spread {context.spread:.2f} is wider than the {max_spread:.2f} limit.")
     if context.volatility == "extreme":
         reasons.append("Volatility is in the extreme bucket. The setup is skipped.")
-    if context.biases.get("D1") not in {"bullish", "bearish"}:
-        reasons.append("Daily bias is not directional.")
+    if context.biases.get(context.primary_tf) not in {"bullish", "bearish"}:
+        reasons.append(f"{context.tf_name(context.primary_tf)} bias is not directional.")
     if context.conflict:
         reasons.append("Timeframes disagree. Confidence is reduced and the setup must clear a higher bar.")
 
@@ -134,11 +141,11 @@ def decide(context: MarketContext, min_confidence: float, min_reward_risk: float
 
 
 def _candidate_direction(context: MarketContext) -> str | None:
-    daily = context.biases.get("D1")
-    hourly = context.biases.get("H1")
-    if daily == "bullish" and hourly != "bearish":
+    primary = context.biases.get(context.primary_tf)
+    confirm = context.biases.get(context.confirm_tf)
+    if primary == "bullish" and confirm != "bearish":
         return "BUY"
-    if daily == "bearish" and hourly != "bullish":
+    if primary == "bearish" and confirm != "bullish":
         return "SELL"
     return None
 
@@ -174,11 +181,12 @@ def _levels(context: MarketContext, direction: str, min_reward_risk: float) -> d
         if stop >= price:
             stop = price - 1.2 * atr_v
         risk = price - stop
-        target = price + max(min_reward_risk * risk, 1.6 * atr_v)
+        target = price + max(min_reward_risk * risk * 1.002, 1.6 * atr_v)
         if context.resistance:
+            # Aim at the nearest resistance that still clears the minimum, not past every level.
             beyond = [level for level in context.resistance if level > price + risk]
             if beyond:
-                target = max(target, beyond[0])
+                target = max(target, min(beyond))
         entry_low, entry_high = price - 0.2 * atr_v, price + 0.05 * atr_v
     else:
         swing = context.resistance[-1] if context.resistance else price + 1.4 * atr_v
@@ -186,19 +194,24 @@ def _levels(context: MarketContext, direction: str, min_reward_risk: float) -> d
         if stop <= price:
             stop = price + 1.2 * atr_v
         risk = stop - price
-        target = price - max(min_reward_risk * risk, 1.6 * atr_v)
+        target = price - max(min_reward_risk * risk * 1.002, 1.6 * atr_v)
         if context.support:
             beyond = [level for level in context.support if level < price - risk]
             if beyond:
-                target = min(target, beyond[-1])
+                target = min(target, max(beyond))
         entry_low, entry_high = price - 0.05 * atr_v, price + 0.2 * atr_v
     if risk <= 0:
         return None
+    stop, target = round(stop, 3), round(target, 3)
+    risk = abs(price - stop)
     reward = abs(target - price)
-    ratio = reward / risk
+    ratio = reward / risk if risk else 0.0
+    # Checked on the rounded levels, exactly as the risk gate will see them.
     if ratio < min_reward_risk:
         return None
-    second = price + (2.6 * risk if direction == "BUY" else -2.6 * risk)
+    # TP2 is always beyond TP1: at least 2.6R, and at least one more R past TP1.
+    extension = max(2.6 * risk, reward + risk)
+    second = price + (extension if direction == "BUY" else -extension)
     return {
         "entry_low": round(entry_low, 3),
         "entry_high": round(entry_high, 3),
@@ -227,10 +240,10 @@ def _score(context: MarketContext, direction: str | None) -> float:
 
 
 def _components(context: MarketContext, direction: str) -> dict[str, float]:
-    daily = context.biases.get("D1")
-    h4 = context.biases.get("H4")
+    primary = context.biases.get(context.primary_tf)
+    secondary = context.biases.get(context.secondary_tf)
     wanted = "bullish" if direction == "BUY" else "bearish"
-    higher = 1.0 if daily == wanted and h4 in {wanted, "ranging", "transition"} else 0.35
+    higher = 1.0 if primary == wanted and secondary in {wanted, "ranging", "transition"} else 0.35
     if direction == "BUY" and context.structure_event == "bos_bullish":
         structure = 1.0
     elif direction == "SELL" and context.structure_event == "bos_bearish":
@@ -284,8 +297,9 @@ def _calibrate(score: float) -> float:
 def _evidence(context: MarketContext, direction: str) -> list[str]:
     wanted = "bullish" if direction == "BUY" else "bearish"
     rows = [
-        f"Daily bias is {context.biases.get('D1')}.",
-        f"H4 bias is {context.biases.get('H4')}; H1 bias is {context.biases.get('H1')}.",
+        f"{context.tf_name(context.primary_tf)} bias is {context.biases.get(context.primary_tf)}.",
+        f"{context.secondary_tf} bias is {context.biases.get(context.secondary_tf)}; "
+        f"{context.confirm_tf} bias is {context.biases.get(context.confirm_tf)}.",
         f"Price is in the {context.premium_discount} portion of the latest dealing range.",
         f"Indicator agreement is {context.indicator_agreement:+.2f} on a -1 to +1 scale.",
         f"Volatility regime is {context.volatility}.",
@@ -296,7 +310,7 @@ def _evidence(context: MarketContext, direction: str) -> list[str]:
         rows.append(f"A {context.sweep_side.replace('_', ' ')} sweep is present.")
     if context.fib_levels:
         rows.append("Fibonacci levels are attached from the latest dealing range and do not trigger a trade alone.")
-    rows.append(f"The candidate direction is {direction}, aligned with the {wanted} daily bias.")
+    rows.append(f"The candidate direction is {direction}, aligned with the {wanted} {context.primary_tf} bias.")
     return rows
 
 

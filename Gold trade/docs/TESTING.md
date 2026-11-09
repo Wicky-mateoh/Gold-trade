@@ -5,7 +5,7 @@ cd "Gold trade" && python -m pytest
 ```
 
 The suite generates all its data in-process, so it needs no network, broker or database.
-It has 108 tests and runs in about 7 seconds.
+It has 118 tests and runs in about 7 seconds.
 
 | File | Covers |
 |---|---|
@@ -18,6 +18,7 @@ It has 108 tests and runs in about 7 seconds.
 | `test_backtest_learning.py` | Trades follow the trend, regime labels are real. **No look-ahead**: truncating the history leaves earlier trades unchanged. A random walk doesn't pass the gate. Costs reduce P&L. Metric math. Monte Carlo ordering. Walk-forward segment roles. Calibration/drift/regime. The classifier stays in draft. Model promotion requires validation and persists. |
 | `test_nfp_cpi.py` | NFP first-Friday rule (with DST and the early-Friday case), CPI candidate days, feed parsing, confirmed dates replacing estimates, cache kept when the feed fails, tier-1 window edges (−60/+60), ordinary events keep the −30/+15 window, countdown and flatten flags. |
 | `test_live_path.py` | The live service path end to end. One open position max. Same bar journaled once. The entry bar isn't used to mark the position. Every new bar is marked. Equity matches the journal. Flatten before NFP. No trade inside the window (signal gate and risk gate separately). Max-hold exit. Slippage protection. TP2 beyond TP1 and R:R surviving rounding. Profile roles. Unfinished higher-TF bars dropped. The daily break doesn't delete H4 bars. The backtest skips NFP/CPI windows. CSV refresh detects new bars. |
+| `test_mt5.py` | MT5 reader against a stand-in for the Windows-only package: broker server time shifted to UTC, spread from 2- and 3-digit point sizes, offset saved and reused when the market is closed, unknown offset flagged, wrong symbol lists the broker's gold symbols, hidden symbol added to Market Watch, login errors explained, contract-size mismatch warned, `DATA_SOURCE=mt5` overriding a CSV. |
 | `test_config.py` | `.env.example` loads as shipped and lists every setting. |
 | `test_api.py` | Status, analysis, signals journaled, candles, live can't be enabled through the API, emergency stop/reset cycle, backtest records a model version, recommendations stripped of risk keys, news ingest, journal persistence. |
 

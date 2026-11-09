@@ -44,16 +44,68 @@ FastAPI serves the built dashboard at `/` whenever `frontend/dist` exists.
 Sources are tried in this order:
 
 1. `data/XAUUSD_M5.csv` with columns `time,open,high,low,close,volume[,spread]`, times in UTC.
-2. **MetaTrader 5** (read-only). Needs Windows with the MT5 terminal installed,
-   `pip install MetaTrader5`, and `MT5_LOGIN`, `MT5_PASSWORD`, `MT5_SERVER`, `MT5_SYMBOL` set.
-   The reader requests M5 rates and never sends orders. MT5 reports spread in points;
-   `market.py` multiplies it by 0.01, so confirm that matches your broker's contract.
+2. **MetaTrader 5** (read-only), see *Connecting your MetaTrader 5 account* below. Bar times
+   are converted from broker server time to UTC, and the spread from points using the
+   symbol's own point size. `DATA_SOURCE=mt5` forces MT5 even if a CSV exists.
 3. **Synthetic**, used when neither is available. The dashboard shows a banner, and the
    example calendar and news rows are loaded.
 
 The background cycle (`AUTO_CYCLE_SECONDS`, default 60) reloads the CSV or pulls MT5 rates,
 checks open simulated positions against every new bar, and evaluates once per new closed
 bar. A failed pull keeps the last good data and is journaled.
+
+## Connecting your MetaTrader 5 account
+
+MT5's Python connection only works on **Windows**, on the same PC as the MT5 terminal.
+Docker containers run Linux, so for MT5 use the bare-metal setup on that Windows PC.
+
+1. **Install and log in to MT5.** Install your broker's MetaTrader 5 terminal, log in once
+   by hand (File > Login to Trade Account), and leave it installed. A demo account is fine.
+2. **Load enough history.** In MT5 open Tools > Options > Charts and set *Max bars in chart*
+   to at least 100000, then open an XAUUSD **M5** chart once so the terminal downloads it.
+3. **Install Python 3.12+ and Node 22+** on the PC, then from the `Gold trade` folder run:
+
+   ```bat
+   pip install -r requirements.txt
+   ```
+
+   On Windows this also installs the `MetaTrader5` package.
+4. **Create `.env`** from `.env.example` and fill in:
+
+   ```ini
+   DATA_SOURCE=mt5
+   MT5_LOGIN=12345678            # your account number
+   MT5_PASSWORD=your_password    # the investor (read-only) password is enough
+   MT5_SERVER=YourBroker-Demo    # exactly as shown in MT5's login window
+   MT5_SYMBOL=XAUUSD             # your broker's exact gold symbol
+   ```
+
+   `.env` is git-ignored. Never commit it.
+5. **Check the connection** (read-only, sends no orders):
+
+   ```bat
+   python scripts\check_mt5.py
+   ```
+
+   It confirms the login, lists your broker's gold symbols if `MT5_SYMBOL` is wrong, detects
+   the broker's server-time offset from UTC, compares contract size and lot rules with
+   `CONTRACT_OUNCES` / `MIN_LOT` / `LOT_STEP`, and prints the latest bars in UTC. Fix
+   anything marked `[WARN]` or `[FAIL]` and run it again until it says **ready**. Run it
+   while the market is open so the time offset can be detected and saved.
+6. **Start the bot:**
+
+   ```bat
+   cd frontend && npm ci && npm run build && cd ..
+   set PYTHONPATH=backend
+   uvicorn app.main:app --port 8000
+   ```
+
+   Open http://localhost:8000. The header should say **metatrader5 data**, and
+   `/api/status` shows the broker, the bar count, and the UTC offset in use.
+
+What the bot does with MT5: every `AUTO_CYCLE_SECONDS` (default 60) it reads the latest
+**closed** M5 bars, converts broker server time to UTC, and runs analysis and simulated
+trading. It never sends orders to your account.
 
 ## NFP & CPI calendar
 

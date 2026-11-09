@@ -8,6 +8,8 @@ keeps the rest of the system testable.
 
 from __future__ import annotations
 
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -24,6 +26,7 @@ class MarketDataEngine:
         self.source = "unloaded"
         self.source_note = "No market data loaded."
         self.warnings: list[str] = []
+        self.mt5_info: dict = {}
 
     def load_base(self, frame: PriceFrame, source: str, note: str) -> None:
         report = validate_frame(frame)
@@ -111,52 +114,144 @@ def synthetic_m5(days: int = 420, seed: int = 42, start: str = "2025-01-06T00:00
 
 
 class MT5Feed:
-    """Optional MetaTrader 5 reader. This class does not send orders."""
+    """Optional MetaTrader 5 reader. This class never sends orders.
 
-    def __init__(self) -> None:
-        try:
-            import MetaTrader5 as mt5  # type: ignore
-        except ImportError:
-            mt5 = None
-        self._mt5 = mt5
+    Requires Windows, a running MT5 terminal, and `pip install MetaTrader5`.
+    MT5 stamps bars in the broker's SERVER time (often UTC+2/UTC+3), so bar
+    times are shifted to UTC before analysis; otherwise sessions and the
+    NFP/CPI windows would be off by hours.
+    """
+
+    def __init__(self, module=None) -> None:
+        if module is None:
+            try:
+                import MetaTrader5 as module  # type: ignore
+            except ImportError:
+                module = None
+        self._mt5 = module
+        self.info: dict = {}
 
     @property
     def installed(self) -> bool:
         return self._mt5 is not None
 
-    def copy_m5(self, symbol: str, login: str, password: str, server: str, count: int = 20000) -> PriceFrame:
+    def connect(self, login: str, password: str, server: str, terminal_path: str = ""):
         if self._mt5 is None:
-            raise RuntimeError("The MetaTrader5 package is not installed. No terminal connection was opened.")
+            raise RuntimeError(
+                "The MetaTrader5 Python package is not installed (Windows only: pip install MetaTrader5)."
+            )
         if not login or not server:
-            raise RuntimeError("MT5 login and server are required before a connection is attempted.")
+            raise RuntimeError("MT5_LOGIN and MT5_SERVER are required before a connection is attempted.")
         mt5 = self._mt5
-        if not mt5.initialize():
-            raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
-        authorized = mt5.login(int(login), password=password, server=server)
-        if not authorized:
+        kwargs = {"path": terminal_path} if terminal_path else {}
+        try:
+            login_id = int(login)
+        except ValueError as exc:
+            raise RuntimeError("MT5_LOGIN must be the numeric account number.") from exc
+        if not mt5.initialize(login=login_id, password=password, server=server, **kwargs):
+            error = mt5.last_error()
             mt5.shutdown()
-            raise RuntimeError(f"MT5 login failed: {mt5.last_error()}")
-        # Position 1 skips the bar that is still forming; analysis uses closed bars only.
-        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 1, count)
-        mt5.shutdown()
+            raise RuntimeError(
+                f"MT5 initialize/login failed: {error}. Check that the MT5 terminal is installed and can log in "
+                "with these details by hand, and that MT5_SERVER matches the server name shown in the terminal."
+            )
+        return mt5
+
+    def resolve_symbol(self, mt5, symbol: str):
+        info = mt5.symbol_info(symbol)
+        if info is None:
+            candidates = sorted(
+                {row.name for pattern in ("*XAU*", "*GOLD*", "*Gold*") for row in (mt5.symbols_get(pattern) or [])}
+            )
+            hint = f" Gold symbols on this server: {', '.join(candidates)}." if candidates else ""
+            raise RuntimeError(f"Symbol {symbol} is not offered by this broker.{hint} Set MT5_SYMBOL to the exact name.")
+        if not info.visible and not mt5.symbol_select(symbol, True):
+            raise RuntimeError(f"Symbol {symbol} could not be added to Market Watch: {mt5.last_error()}")
+        return mt5.symbol_info(symbol) or info
+
+    def server_offset_hours(self, mt5, symbol: str, configured: float | None, cache: Path | None) -> tuple[float, str]:
+        """Broker server time minus UTC, in hours."""
+        if configured is not None:
+            return float(configured), "configured"
+        tick = mt5.symbol_info_tick(symbol)
+        now = datetime.now(timezone.utc).timestamp()
+        if tick is not None and getattr(tick, "time", 0):
+            raw = float(tick.time) - now
+            hours = round(raw / 1800) / 2  # half-hour resolution
+            # Only trust a fresh tick (market open): the remainder must be small.
+            if abs(raw - hours * 3600) < 600 and abs(hours) <= 14:
+                if cache is not None:
+                    cache.parent.mkdir(parents=True, exist_ok=True)
+                    cache.write_text(json.dumps({"hours": hours, "detected_at": datetime.now(timezone.utc).isoformat()}))
+                return hours, "detected from live tick"
+        if cache is not None and cache.exists():
+            try:
+                return float(json.loads(cache.read_text())["hours"]), "last detected value (market closed)"
+            except (ValueError, KeyError, OSError):
+                pass
+        return 0.0, "UNKNOWN - market closed and no saved value; set MT5_SERVER_UTC_OFFSET_HOURS"
+
+    def copy_m5(
+        self,
+        symbol: str,
+        login: str,
+        password: str,
+        server: str,
+        count: int = 100_000,
+        terminal_path: str = "",
+        offset_hours: float | None = None,
+        offset_cache: Path | None = None,
+    ) -> PriceFrame:
+        mt5 = self.connect(login, password, server, terminal_path)
+        try:
+            info = self.resolve_symbol(mt5, symbol)
+            offset, offset_source = self.server_offset_hours(mt5, symbol, offset_hours, offset_cache)
+            # Position 1 skips the bar that is still forming; analysis uses closed bars only.
+            rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 1, count)
+            account = mt5.account_info()
+        finally:
+            mt5.shutdown()
         if rates is None or len(rates) == 0:
-            raise RuntimeError("MT5 returned no M5 rates.")
+            raise RuntimeError(
+                "MT5 returned no M5 rates. Open an XAUUSD M5 chart once so the terminal downloads history, "
+                "and check Tools > Options > Charts > Max bars in chart."
+            )
+        point = float(getattr(info, "point", 0.01) or 0.01)
+        self.info = {
+            "symbol": symbol,
+            "digits": getattr(info, "digits", None),
+            "point": point,
+            "contract_size": getattr(info, "trade_contract_size", None),
+            "volume_min": getattr(info, "volume_min", None),
+            "volume_step": getattr(info, "volume_step", None),
+            "server_utc_offset_hours": offset,
+            "offset_source": offset_source,
+            "bars": int(len(rates)),
+            "account_server": getattr(account, "server", server),
+            "account_trade_mode": getattr(account, "trade_mode", None),
+        }
+        utc_seconds = rates["time"].astype("int64") - int(round(offset * 3600))
         return PriceFrame(
             "M5",
-            pd.to_datetime(rates["time"], unit="s", utc=True),
+            pd.to_datetime(utc_seconds, unit="s", utc=True),
             rates["open"],
             rates["high"],
             rates["low"],
             rates["close"],
             rates["tick_volume"],
-            rates["spread"] * 0.01,
+            rates["spread"] * point,  # MT5 spread is in points; point is 0.01 or 0.001 depending on the broker
         )
 
 
-def build_engine(root: Path, symbol: str, mt5_login: str, mt5_password: str, mt5_server: str) -> MarketDataEngine:
+def build_engine(root: Path, settings) -> MarketDataEngine:
+    """Pick the data source: DATA_SOURCE=auto uses a CSV if present, else MT5, else synthetic."""
+    s = settings
     engine = MarketDataEngine()
-    csv_path = root / "data" / f"{symbol}_M5.csv"
-    if csv_path.exists():
+    csv_path = root / "data" / f"{s.mt5_symbol}_M5.csv"
+    mode = getattr(s, "data_source", "auto")
+    if mode == "csv" or (mode == "auto" and csv_path.exists()):
+        if not csv_path.exists():
+            raise RuntimeError(f"DATA_SOURCE=csv but {csv_path} does not exist.")
         engine.load_base(
             load_csv(csv_path),
             source="csv",
@@ -164,9 +259,30 @@ def build_engine(root: Path, symbol: str, mt5_login: str, mt5_password: str, mt5
         )
         return engine
     feed = MT5Feed()
-    if feed.installed and mt5_login and mt5_server:
-        frame = feed.copy_m5(symbol, mt5_login, mt5_password, mt5_server)
-        engine.load_base(frame, source="metatrader5", note="M5 rates requested from the configured MT5 terminal.")
+    if mode == "mt5" or (feed.installed and s.mt5_login and s.mt5_server):
+        frame = feed.copy_m5(
+            s.mt5_symbol,
+            s.mt5_login,
+            s.mt5_password,
+            s.mt5_server,
+            count=s.mt5_history_bars,
+            terminal_path=s.mt5_terminal_path,
+            offset_hours=s.mt5_server_utc_offset_hours,
+            offset_cache=root / "var" / "mt5_server_offset.json",
+        )
+        info = feed.info
+        engine.load_base(
+            frame,
+            source="metatrader5",
+            note=(
+                f"MT5 {info['account_server']} {info['symbol']}: {info['bars']} closed M5 bars, "
+                f"server time UTC{info['server_utc_offset_hours']:+g} ({info['offset_source']}), shifted to UTC."
+            ),
+        )
+        engine.mt5_info = info
+        if info["offset_source"].startswith("UNKNOWN"):
+            engine.warnings.append("MT5 server time offset is unknown; sessions and NFP/CPI windows may be shifted.")
+        _check_contract(engine, info, s)
         return engine
     engine.load_base(
         synthetic_m5(),
@@ -174,3 +290,14 @@ def build_engine(root: Path, symbol: str, mt5_login: str, mt5_password: str, mt5
         note="Synthetic XAU/USD path for development. It is not a broker feed and is not evidence of an edge.",
     )
     return engine
+
+
+def _check_contract(engine: MarketDataEngine, info: dict, settings) -> None:
+    """Position sizing uses CONTRACT_OUNCES/MIN_LOT/LOT_STEP; warn when the broker differs."""
+    for key, setting in (("contract_size", "contract_ounces"), ("volume_min", "min_lot"), ("volume_step", "lot_step")):
+        broker = info.get(key)
+        mine = getattr(settings, setting)
+        if broker is not None and abs(float(broker) - float(mine)) > 1e-9:
+            engine.warnings.append(
+                f"Broker {key} is {broker} but {setting.upper()} is {mine}. Update .env so position sizes are correct."
+            )

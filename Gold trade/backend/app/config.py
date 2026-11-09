@@ -34,6 +34,14 @@ class Settings(BaseSettings):
     mt5_password: str = ""
     mt5_server: str = ""
     mt5_symbol: str = "XAUUSD"
+    # Path to terminal64.exe; only needed when several MT5 terminals are installed.
+    mt5_terminal_path: str = ""
+    # M5 bars to request (100k ~ 1.4 years). The terminal's "Max bars in chart" must be at least this.
+    mt5_history_bars: int = 100_000
+    # Broker server time minus UTC, in hours (e.g. 2 or 3). Empty = detect from the live tick.
+    mt5_server_utc_offset_hours: float | None = None
+    # mt5 = use the MT5 terminal even if a CSV exists; csv = CSV only; auto = CSV if present, else MT5.
+    data_source: str = "auto"
 
     max_risk_per_trade_pct: float = 0.5
     max_daily_loss_pct: float = 2.0
@@ -73,6 +81,14 @@ class Settings(BaseSettings):
         normalized = value.strip().lower()
         if normalized not in allowed:
             raise ValueError(f"APP_MODE must be one of {sorted(allowed)}")
+        return normalized
+
+    @field_validator("data_source")
+    @classmethod
+    def _source(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"auto", "mt5", "csv"}:
+            raise ValueError("DATA_SOURCE must be auto, mt5 or csv")
         return normalized
 
     @field_validator("strategy_profile")

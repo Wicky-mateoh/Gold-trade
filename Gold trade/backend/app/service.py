@@ -45,7 +45,7 @@ class TradingService:
         self.root = root
         self.state_dir = state_dir or root / "var"
         self.lock = threading.RLock()
-        self.engine = engine or build_engine(root, settings.mt5_symbol, settings.mt5_login, settings.mt5_password, settings.mt5_server)
+        self.engine = engine or build_engine(root, settings)
         self.events: list[EconomicEvent] = load_calendar(root / "data" / "economic_calendar.csv")
         self.news: list[NewsItem] = load_news_directory(root / "data" / "news")
         self.content_note = "Calendar and news come from operator-supplied files."
@@ -93,6 +93,8 @@ class TradingService:
             + ([] if self.book.adapter.ready else ["a ready broker adapter"]),
             "data_source": self.engine.source,
             "data_note": self.engine.source_note,
+            "data_warnings": self.engine.warnings[-10:],
+            "mt5": self.engine.mt5_info or None,
             "content_note": self.content_note,
             "journal_backend": self.journal.backend,
             "cache_backend": self.cache.backend,
@@ -232,7 +234,7 @@ class TradingService:
         before = None if base is None or len(base) == 0 else base.time[-1]
         s = self.settings
         try:
-            fresh = build_engine(self.root, s.mt5_symbol, s.mt5_login, s.mt5_password, s.mt5_server)
+            fresh = build_engine(self.root, s)
         except Exception as exc:  # a failed pull keeps the last good data
             self.journal.record("operator_note", {"refresh_error": str(exc)}, note="Market data refresh failed.")
             return {"refreshed": False, "new_bars": 0, "reason": str(exc)}

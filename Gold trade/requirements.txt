@@ -8,6 +8,8 @@ numpy==2.2.1
 scikit-learn==1.6.0
 pytest==8.3.4
 httpx==0.28.1
+# MetaTrader 5 price feed (the package only exists for Windows)
+MetaTrader5; sys_platform == "win32"
 # Optional: PostgreSQL journal mirror and Redis cache
 psycopg[binary]==3.2.3
 redis==5.2.1

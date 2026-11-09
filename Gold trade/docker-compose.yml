@@ -32,9 +32,12 @@ services:
       LIVE_TRADING_AUTHORIZED: "false"
     ports:
       - "8000:8000"
+    volumes:
+      - gits_var:/app/var
     depends_on:
       postgres:
         condition: service_healthy
 
 volumes:
   gits_pg:
+  gits_var:
